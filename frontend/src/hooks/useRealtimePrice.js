@@ -17,9 +17,24 @@ const useRealtimePrice = (symbol, initialPrice, initialChange) => {
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 5;
 
+    // Get the correct WebSocket URL based on environment
+    const getWebSocketUrl = () => {
+      // In production, use the Render URL
+      if (import.meta.env.PROD) {
+        // Replace https with wss for WebSocket
+        const apiUrl = import.meta.env.VITE_API_URL || 'https://stockvision-pro-jbve.onrender.com';
+        return apiUrl.replace('https://', 'wss://') + '/ws';
+      }
+      // In development, use localhost
+      return 'ws://localhost:8000/ws';
+    };
+
     const connectWebSocket = () => {
       try {
-        ws = new WebSocket('ws://localhost:8000/ws');
+        const wsUrl = getWebSocketUrl();
+        console.log('Connecting to WebSocket:', wsUrl);
+        
+        ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
           console.log(`WebSocket connected for ${symbol}`);
@@ -76,8 +91,11 @@ const useRealtimePrice = (symbol, initialPrice, initialChange) => {
     const pollInterval = setInterval(async () => {
       if (!connected) {
         try {
-          // You can implement polling here if WebSocket fails
-          // For now, just keep using the initial values
+          // Fallback to REST API if WebSocket fails
+          const response = await fetch(`${import.meta.env.VITE_API_URL}/api/stock/${symbol}`);
+          const data = await response.json();
+          setPrice(data.current_price);
+          setChange(data.change_percent);
         } catch (error) {
           console.error('Error polling price:', error);
         }
