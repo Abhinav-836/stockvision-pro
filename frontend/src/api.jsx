@@ -1,4 +1,7 @@
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// frontend/src/api.jsx
+
+// FIXED: Remove trailing slash from base URL
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
 
 const CACHE_DURATION = 60 * 1000; // 1 minute
 const cache = new Map();
@@ -28,7 +31,17 @@ async function fetchWithRetry(url, options = {}, retries = 3) {
 }
 
 async function fetchAPI(endpoint, options = {}) {
-  const url = endpoint.startsWith('http') ? endpoint : `${API_BASE_URL}${endpoint}`;
+  // FIXED: Properly construct URL without double slashes
+  let url;
+  if (endpoint.startsWith('http')) {
+    url = endpoint;
+  } else {
+    // Ensure endpoint starts with / and base doesn't end with /
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    url = `${API_BASE_URL}${cleanEndpoint}`;
+  }
+  
+  console.log('📡 Fetching:', url); // Debug log
   
   try {
     const controller = new AbortController();
@@ -145,7 +158,7 @@ export async function compareStocks(symbols, useCache = true) {
     if (cached) return cached;
   }
 
-  const data = await fetchWithRetry('/api/ai/compare', {  // Using AI compare endpoint
+  const data = await fetchWithRetry('/api/ai/compare', {
     method: 'POST',
     body: JSON.stringify({ symbols: cleanSymbols })
   });
@@ -169,11 +182,17 @@ export async function getTrendingStocks(useCache = true) {
   }
 }
 
+export async function clearCache() {
+  cache.clear();
+  console.log('Cache cleared');
+}
+
 export default {
   healthCheck,
   getMarketIndices,
   getStockAnalysis,
   getStockChartData,
   compareStocks,
-  getTrendingStocks
+  getTrendingStocks,
+  clearCache
 };

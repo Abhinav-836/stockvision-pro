@@ -1,4 +1,4 @@
-// frontend/src/components/StockForm.jsx (COMPLETE FIXED VERSION)
+// frontend/src/components/StockForm.jsx (FIXED VERSION)
 
 import React, { useState, useEffect } from 'react';
 import { getStockAnalysis, getStockChartData } from '../api';
@@ -43,9 +43,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
     try {
       const data = await getStockAnalysis(cleanSymbol);
-      console.log('📊 API Response:', data); // DEBUG: Check what we get
-      
-      // The data is already flat - no nested structure needed!
+      console.log('📊 API Response:', data);
       setStockData(data);
       await fetchChartData(cleanSymbol, chartPeriod);
     } catch (err) {
@@ -93,7 +91,6 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
   const popularSymbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'RELIANCE.NS'];
 
-  // FIXED: Proper number formatting
   const formatNumber = (num) => {
     if (num === null || num === undefined) return 'N/A';
     if (num === 0) return '$0';
@@ -105,12 +102,15 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     return 'N/A';
   };
 
+  // FIXED: Safer formatLargeNumber function
   const formatLargeNumber = (num) => {
     if (num === null || num === undefined) return 'N/A';
-    if (num >= 1e12) return `$${(num / 1e12).toFixed(2)}T`;
-    if (num >= 1e9) return `$${(num / 1e9).toFixed(2)}B`;
-    if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
-    return `$${num.toFixed(0)}`;
+    const parsedNum = typeof num === 'number' ? num : parseFloat(num);
+    if (isNaN(parsedNum) || parsedNum === 0) return 'N/A';
+    if (parsedNum >= 1e12) return `$${(parsedNum / 1e12).toFixed(2)}T`;
+    if (parsedNum >= 1e9) return `$${(parsedNum / 1e9).toFixed(2)}B`;
+    if (parsedNum >= 1e6) return `$${(parsedNum / 1e6).toFixed(2)}M`;
+    return `$${parsedNum.toFixed(0)}`;
   };
 
   const isInWatchlist = stockData && watchlist.includes(stockData.symbol);
@@ -120,14 +120,6 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     current_price: realtimePrice ?? stockData.current_price,
     change_percent: realtimeChange ?? stockData.change_percent
   } : null;
-
-  // FIXED: Metrics with direct access to data
-  const getMetricValue = (key) => {
-    if (!displayData) return 'N/A';
-    const value = displayData[key];
-    if (value === null || value === undefined) return 'N/A';
-    return value;
-  };
 
   return (
     <div className="stock-analysis">
@@ -365,74 +357,63 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
             </div>
           </div>
 
-          {/* Metrics Grid - DIRECT ACCESS TO DATA */}
+          {/* Metrics Grid */}
           <div className="metrics-section glass-card">
             <div className="metrics-header">
               <i className="fas fa-cubes"></i>
               <h3>Key Financial Metrics</h3>
             </div>
             <div className="metrics-grid">
-              {/* Market Cap */}
               <div className="metric-card">
                 <span className="metric-label">Market Cap</span>
                 <span className="metric-value">{formatLargeNumber(displayData.market_cap)}</span>
               </div>
               
-              {/* P/E Ratio */}
               <div className="metric-card">
                 <span className="metric-label">P/E Ratio</span>
                 <span className="metric-value">{displayData.pe_ratio?.toFixed(2) || 'N/A'}</span>
               </div>
               
-              {/* P/B Ratio */}
               <div className="metric-card">
                 <span className="metric-label">P/B Ratio</span>
                 <span className="metric-value">{displayData.pb_ratio?.toFixed(2) || 'N/A'}</span>
               </div>
               
-              {/* EPS */}
               <div className="metric-card">
                 <span className="metric-label">EPS</span>
                 <span className="metric-value">{displayData.eps ? `$${displayData.eps.toFixed(2)}` : 'N/A'}</span>
               </div>
               
-              {/* ROE */}
               <div className="metric-card">
                 <span className="metric-label">ROE</span>
                 <span className="metric-value">{displayData.roe ? `${displayData.roe.toFixed(2)}%` : 'N/A'}</span>
               </div>
               
-              {/* Dividend Yield */}
               <div className="metric-card">
                 <span className="metric-label">Div Yield</span>
                 <span className="metric-value">{displayData.dividend_yield ? `${displayData.dividend_yield.toFixed(2)}%` : '0%'}</span>
               </div>
               
-              {/* Debt to Equity */}
               <div className="metric-card">
                 <span className="metric-label">D/E Ratio</span>
                 <span className="metric-value">{displayData.debt_to_equity?.toFixed(2) || 'N/A'}</span>
               </div>
               
-              {/* Volatility */}
               <div className="metric-card">
                 <span className="metric-label">Volatility</span>
                 <span className="metric-value">{displayData.volatility?.toFixed(2) || 'N/A'}</span>
               </div>
               
-              {/* 52W High */}
               <div className="metric-card">
                 <span className="metric-label">52W High</span>
                 <span className="metric-value">{displayData.fifty_two_week_high ? `$${displayData.fifty_two_week_high.toFixed(2)}` : 'N/A'}</span>
               </div>
               
-              {/* 52W Low */}
               <div className="metric-card">
                 <span className="metric-label">52W Low</span>
                 <span className="metric-value">{displayData.fifty_two_week_low ? `$${displayData.fifty_two_week_low.toFixed(2)}` : 'N/A'}</span>
               </div>
               
-              {/* Avg Volume */}
               <div className="metric-card">
                 <span className="metric-label">Avg Volume</span>
                 <span className="metric-value">{displayData.average_volume ? `${(displayData.average_volume / 1e6).toFixed(2)}M` : 'N/A'}</span>
