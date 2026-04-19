@@ -1,4 +1,4 @@
-// frontend/src/components/StockForm.jsx (FIXED VERSION)
+// frontend/src/components/StockForm.jsx (COMPLETE FIXED VERSION)
 
 import React, { useState, useEffect } from 'react';
 import { getStockAnalysis, getStockChartData } from '../api';
@@ -43,11 +43,13 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
     try {
       const data = await getStockAnalysis(cleanSymbol);
-      console.log('API Response:', data); // Debug: Check what data we get
+      console.log('📊 API Response:', data); // DEBUG: Check what we get
+      
+      // The data is already flat - no nested structure needed!
       setStockData(data);
       await fetchChartData(cleanSymbol, chartPeriod);
     } catch (err) {
-      console.error('API Error:', err);
+      console.error('❌ API Error:', err);
       setError(err.message || 'Failed to fetch stock data');
     } finally {
       setLoading(false);
@@ -91,7 +93,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
   const popularSymbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'RELIANCE.NS'];
 
-  // FIXED: formatNumber handles 0 correctly
+  // FIXED: Proper number formatting
   const formatNumber = (num) => {
     if (num === null || num === undefined) return 'N/A';
     if (num === 0) return '$0';
@@ -99,7 +101,16 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     if (num >= 1e9) return `$${(num / 1e9).toFixed(2)}B`;
     if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
     if (num >= 1e3) return `$${(num / 1e3).toFixed(2)}K`;
-    return `$${num.toFixed(2)}`;
+    if (typeof num === 'number' && !isNaN(num)) return `$${num.toFixed(2)}`;
+    return 'N/A';
+  };
+
+  const formatLargeNumber = (num) => {
+    if (num === null || num === undefined) return 'N/A';
+    if (num >= 1e12) return `$${(num / 1e12).toFixed(2)}T`;
+    if (num >= 1e9) return `$${(num / 1e9).toFixed(2)}B`;
+    if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
+    return `$${num.toFixed(0)}`;
   };
 
   const isInWatchlist = stockData && watchlist.includes(stockData.symbol);
@@ -110,20 +121,13 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     change_percent: realtimeChange ?? stockData.change_percent
   } : null;
 
-  // FIXED: Metrics array with proper null handling
-  const metrics = [
-    { key: 'market_cap', label: 'Market Cap', format: (v) => v ? formatNumber(v) : 'N/A' },
-    { key: 'pe_ratio', label: 'P/E Ratio', format: (v) => v ? v.toFixed(2) : 'N/A' },
-    { key: 'pb_ratio', label: 'P/B Ratio', format: (v) => v ? v.toFixed(2) : 'N/A' },
-    { key: 'eps', label: 'EPS', format: (v) => v ? `$${v.toFixed(2)}` : 'N/A' },
-    { key: 'roe', label: 'ROE', format: (v) => v ? `${v.toFixed(2)}%` : 'N/A' },
-    { key: 'dividend_yield', label: 'Div Yield', format: (v) => v ? `${v.toFixed(2)}%` : '0%' },
-    { key: 'debt_to_equity', label: 'D/E', format: (v) => v ? v.toFixed(2) : 'N/A' },
-    { key: 'volatility', label: 'Volatility', format: (v) => v ? v.toFixed(2) : 'N/A' },
-    { key: 'fifty_two_week_high', label: '52W High', format: (v) => v && v > 0 ? `$${v.toFixed(2)}` : 'N/A' },
-    { key: 'fifty_two_week_low', label: '52W Low', format: (v) => v && v > 0 ? `$${v.toFixed(2)}` : 'N/A' },
-    { key: 'average_volume', label: 'Avg Volume', format: (v) => v ? `${(v / 1e6).toFixed(2)}M` : 'N/A' },
-  ];
+  // FIXED: Metrics with direct access to data
+  const getMetricValue = (key) => {
+    if (!displayData) return 'N/A';
+    const value = displayData[key];
+    if (value === null || value === undefined) return 'N/A';
+    return value;
+  };
 
   return (
     <div className="stock-analysis">
@@ -284,7 +288,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               </div>
               <span className="confidence-badge">
                 <i className="fas fa-shield-alt"></i>
-                Confidence: {displayData.confidence || 'High'}
+                Confidence: {displayData.confidence || 'N/A'}
               </span>
             </div>
 
@@ -351,31 +355,88 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               {displayData.growth_metrics?.revenue_growth && (
                 <div className="growth-metrics">
                   <span className="growth-metric">
-                    Revenue: {displayData.growth_metrics.revenue_growth}%
+                    Revenue Growth: {displayData.growth_metrics.revenue_growth}%
+                  </span>
+                  <span className="growth-metric">
+                    Earnings Growth: {displayData.growth_metrics.earnings_growth}%
                   </span>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Metrics Grid - FIXED: Shows all metrics even if value is 0 */}
+          {/* Metrics Grid - DIRECT ACCESS TO DATA */}
           <div className="metrics-section glass-card">
             <div className="metrics-header">
               <i className="fas fa-cubes"></i>
               <h3>Key Financial Metrics</h3>
             </div>
             <div className="metrics-grid">
-              {metrics.map(({ key, label, format }) => {
-                const value = displayData[key];
-                // FIXED: Show metric even if value is 0, only hide if null/undefined
-                if (value === null || value === undefined) return null;
-                return (
-                  <div key={key} className="metric-card">
-                    <span className="metric-label">{label}</span>
-                    <span className="metric-value">{format(value)}</span>
-                  </div>
-                );
-              })}
+              {/* Market Cap */}
+              <div className="metric-card">
+                <span className="metric-label">Market Cap</span>
+                <span className="metric-value">{formatLargeNumber(displayData.market_cap)}</span>
+              </div>
+              
+              {/* P/E Ratio */}
+              <div className="metric-card">
+                <span className="metric-label">P/E Ratio</span>
+                <span className="metric-value">{displayData.pe_ratio?.toFixed(2) || 'N/A'}</span>
+              </div>
+              
+              {/* P/B Ratio */}
+              <div className="metric-card">
+                <span className="metric-label">P/B Ratio</span>
+                <span className="metric-value">{displayData.pb_ratio?.toFixed(2) || 'N/A'}</span>
+              </div>
+              
+              {/* EPS */}
+              <div className="metric-card">
+                <span className="metric-label">EPS</span>
+                <span className="metric-value">{displayData.eps ? `$${displayData.eps.toFixed(2)}` : 'N/A'}</span>
+              </div>
+              
+              {/* ROE */}
+              <div className="metric-card">
+                <span className="metric-label">ROE</span>
+                <span className="metric-value">{displayData.roe ? `${displayData.roe.toFixed(2)}%` : 'N/A'}</span>
+              </div>
+              
+              {/* Dividend Yield */}
+              <div className="metric-card">
+                <span className="metric-label">Div Yield</span>
+                <span className="metric-value">{displayData.dividend_yield ? `${displayData.dividend_yield.toFixed(2)}%` : '0%'}</span>
+              </div>
+              
+              {/* Debt to Equity */}
+              <div className="metric-card">
+                <span className="metric-label">D/E Ratio</span>
+                <span className="metric-value">{displayData.debt_to_equity?.toFixed(2) || 'N/A'}</span>
+              </div>
+              
+              {/* Volatility */}
+              <div className="metric-card">
+                <span className="metric-label">Volatility</span>
+                <span className="metric-value">{displayData.volatility?.toFixed(2) || 'N/A'}</span>
+              </div>
+              
+              {/* 52W High */}
+              <div className="metric-card">
+                <span className="metric-label">52W High</span>
+                <span className="metric-value">{displayData.fifty_two_week_high ? `$${displayData.fifty_two_week_high.toFixed(2)}` : 'N/A'}</span>
+              </div>
+              
+              {/* 52W Low */}
+              <div className="metric-card">
+                <span className="metric-label">52W Low</span>
+                <span className="metric-value">{displayData.fifty_two_week_low ? `$${displayData.fifty_two_week_low.toFixed(2)}` : 'N/A'}</span>
+              </div>
+              
+              {/* Avg Volume */}
+              <div className="metric-card">
+                <span className="metric-label">Avg Volume</span>
+                <span className="metric-value">{displayData.average_volume ? `${(displayData.average_volume / 1e6).toFixed(2)}M` : 'N/A'}</span>
+              </div>
             </div>
           </div>
 
@@ -392,7 +453,14 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                     <span className="technical-label">RSI (14)</span>
                     <span className="technical-value">{displayData.technical_indicators.rsi.toFixed(2)}</span>
                     <div className="rsi-indicator">
-                      <div className="rsi-bar" style={{ width: `${displayData.technical_indicators.rsi}%` }}></div>
+                      <div 
+                        className="rsi-bar" 
+                        style={{ 
+                          width: `${displayData.technical_indicators.rsi}%`,
+                          background: displayData.technical_indicators.rsi > 70 ? '#ef4444' : 
+                                     displayData.technical_indicators.rsi < 30 ? '#10b981' : '#f59e0b'
+                        }}
+                      ></div>
                     </div>
                   </div>
                 )}
