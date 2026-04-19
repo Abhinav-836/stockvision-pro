@@ -235,7 +235,7 @@ function App() {
       <footer className="glass-footer">
         <div className="container">
           <div className="footer-content">
-            <p>© 2025 StockVision Pro. AI-powered insights for smarter investing.</p>
+          <p>© 2025 StockVision Pro by StrattonTrade. AI-powered insights for smarter investing.</p>
             <div className="footer-links">
               <span><i className="fas fa-shield-alt"></i> Not A Financial Advice</span>
               <span><i className="fas fa-robot"></i> AI-Generated Insights</span>
