@@ -1,3 +1,5 @@
+// frontend/src/components/StockForm.jsx (FIXED VERSION)
+
 import React, { useState, useEffect } from 'react';
 import { getStockAnalysis, getStockChartData } from '../api';
 import StockChart from './StockChart';
@@ -12,8 +14,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
   const [chartData, setChartData] = useState([]);
   const [chartPeriod, setChartPeriod] = useState('1mo');
 
-  // Use real-time price updates
-  const { price: realtimePrice, change: realtimeChange } = useRealtimePrice(
+  const { price: realtimePrice, change: realtimeChange, connected } = useRealtimePrice(
     stockData?.symbol,
     stockData?.current_price,
     stockData?.change_percent
@@ -42,10 +43,12 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
     try {
       const data = await getStockAnalysis(cleanSymbol);
+      console.log('API Response:', data); // Debug: Check what data we get
       setStockData(data);
       await fetchChartData(cleanSymbol, chartPeriod);
     } catch (err) {
-      setError(err.message);
+      console.error('API Error:', err);
+      setError(err.message || 'Failed to fetch stock data');
     } finally {
       setLoading(false);
     }
@@ -88,34 +91,38 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
   const popularSymbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'RELIANCE.NS'];
 
+  // FIXED: formatNumber handles 0 correctly
   const formatNumber = (num) => {
-    if (!num && num !== 0) return 'N/A';
+    if (num === null || num === undefined) return 'N/A';
+    if (num === 0) return '$0';
     if (num >= 1e12) return `$${(num / 1e12).toFixed(2)}T`;
     if (num >= 1e9) return `$${(num / 1e9).toFixed(2)}B`;
     if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
+    if (num >= 1e3) return `$${(num / 1e3).toFixed(2)}K`;
     return `$${num.toFixed(2)}`;
   };
 
   const isInWatchlist = stockData && watchlist.includes(stockData.symbol);
 
-  // Merge real-time data with stock data
   const displayData = stockData ? {
     ...stockData,
     current_price: realtimePrice ?? stockData.current_price,
     change_percent: realtimeChange ?? stockData.change_percent
   } : null;
 
+  // FIXED: Metrics array with proper null handling
   const metrics = [
-    { key: 'market_cap', label: 'Market Cap', format: formatNumber },
-    { key: 'pe_ratio', label: 'P/E Ratio', format: (v) => v?.toFixed(2) },
-    { key: 'pb_ratio', label: 'P/B Ratio', format: (v) => v?.toFixed(2) },
+    { key: 'market_cap', label: 'Market Cap', format: (v) => v ? formatNumber(v) : 'N/A' },
+    { key: 'pe_ratio', label: 'P/E Ratio', format: (v) => v ? v.toFixed(2) : 'N/A' },
+    { key: 'pb_ratio', label: 'P/B Ratio', format: (v) => v ? v.toFixed(2) : 'N/A' },
     { key: 'eps', label: 'EPS', format: (v) => v ? `$${v.toFixed(2)}` : 'N/A' },
     { key: 'roe', label: 'ROE', format: (v) => v ? `${v.toFixed(2)}%` : 'N/A' },
-    { key: 'dividend_yield', label: 'Div Yield', format: (v) => v ? `${v.toFixed(2)}%` : 'N/A' },
-    { key: 'debt_to_equity', label: 'D/E', format: (v) => v?.toFixed(2) },
-    { key: 'volatility', label: 'Volatility', format: (v) => v?.toFixed(2) },
-    { key: 'fifty_two_week_high', label: '52W High', format: (v) => v ? `$${v}` : 'N/A' },
-    { key: 'fifty_two_week_low', label: '52W Low', format: (v) => v ? `$${v}` : 'N/A' },
+    { key: 'dividend_yield', label: 'Div Yield', format: (v) => v ? `${v.toFixed(2)}%` : '0%' },
+    { key: 'debt_to_equity', label: 'D/E', format: (v) => v ? v.toFixed(2) : 'N/A' },
+    { key: 'volatility', label: 'Volatility', format: (v) => v ? v.toFixed(2) : 'N/A' },
+    { key: 'fifty_two_week_high', label: '52W High', format: (v) => v && v > 0 ? `$${v.toFixed(2)}` : 'N/A' },
+    { key: 'fifty_two_week_low', label: '52W Low', format: (v) => v && v > 0 ? `$${v.toFixed(2)}` : 'N/A' },
+    { key: 'average_volume', label: 'Avg Volume', format: (v) => v ? `${(v / 1e6).toFixed(2)}M` : 'N/A' },
   ];
 
   return (
@@ -134,11 +141,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               className="search-input"
             />
             {symbol && (
-              <button
-                type="button"
-                className="clear-btn"
-                onClick={() => setSymbol('')}
-              >
+              <button type="button" className="clear-btn" onClick={() => setSymbol('')}>
                 <i className="fas fa-times"></i>
               </button>
             )}
@@ -168,7 +171,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 disabled={loading}
                 className="symbol-tag"
               >
-                {testSymbol}
+                {testSymbol.replace('.NS', '')}
               </button>
             ))}
           </div>
@@ -185,6 +188,14 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
       {/* Results */}
       {displayData && (
         <div className="results-container">
+          {/* Connection Status */}
+          {!connected && (
+            <div className="connection-warning">
+              <i className="fas fa-plug"></i>
+              <span>Using cached data - WebSocket disconnected</span>
+            </div>
+          )}
+
           {/* Stock Header */}
           <div className="stock-header glass-card">
             <div className="header-left">
@@ -198,7 +209,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 </button>
               </div>
               <div className="company-info">
-                <h2 className="company-name">{displayData.company_name}</h2>
+                <h2 className="company-name">{displayData.company_name || displayData.symbol}</h2>
                 <div className="stock-tags">
                   {displayData.exchange && (
                     <span className="tag exchange">
@@ -215,7 +226,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                   {displayData.is_indian_stock && (
                     <span className="tag indian">
                       <i className="fas fa-flag"></i>
-                      Indian Stock
+                      NSE/BSE
                     </span>
                   )}
                 </div>
@@ -337,10 +348,17 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 <span className="growth-label">Growth Potential</span>
                 <span className="growth-value">{displayData.growth_potential || 'N/A'}</span>
               </div>
+              {displayData.growth_metrics?.revenue_growth && (
+                <div className="growth-metrics">
+                  <span className="growth-metric">
+                    Revenue: {displayData.growth_metrics.revenue_growth}%
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Metrics Grid */}
+          {/* Metrics Grid - FIXED: Shows all metrics even if value is 0 */}
           <div className="metrics-section glass-card">
             <div className="metrics-header">
               <i className="fas fa-cubes"></i>
@@ -349,6 +367,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
             <div className="metrics-grid">
               {metrics.map(({ key, label, format }) => {
                 const value = displayData[key];
+                // FIXED: Show metric even if value is 0, only hide if null/undefined
                 if (value === null || value === undefined) return null;
                 return (
                   <div key={key} className="metric-card">
@@ -371,7 +390,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 {displayData.technical_indicators.rsi && (
                   <div className="technical-card">
                     <span className="technical-label">RSI (14)</span>
-                    <span className="technical-value">{displayData.technical_indicators.rsi}</span>
+                    <span className="technical-value">{displayData.technical_indicators.rsi.toFixed(2)}</span>
                     <div className="rsi-indicator">
                       <div className="rsi-bar" style={{ width: `${displayData.technical_indicators.rsi}%` }}></div>
                     </div>
@@ -380,19 +399,20 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 {displayData.technical_indicators.sma_20 && (
                   <div className="technical-card">
                     <span className="technical-label">SMA 20</span>
-                    <span className="technical-value">${displayData.technical_indicators.sma_20}</span>
+                    <span className="technical-value">${displayData.technical_indicators.sma_20.toFixed(2)}</span>
                   </div>
                 )}
                 {displayData.technical_indicators.sma_50 && (
                   <div className="technical-card">
                     <span className="technical-label">SMA 50</span>
-                    <span className="technical-value">${displayData.technical_indicators.sma_50}</span>
+                    <span className="technical-value">${displayData.technical_indicators.sma_50.toFixed(2)}</span>
                   </div>
                 )}
                 {displayData.technical_indicators.trend && (
                   <div className="technical-card trend">
                     <span className="technical-label">Trend</span>
                     <span className={`trend-value ${displayData.technical_indicators.trend.toLowerCase().includes('bull') ? 'bullish' : 'bearish'}`}>
+                      <i className={`fas fa-${displayData.technical_indicators.trend.toLowerCase().includes('bull') ? 'arrow-up' : 'arrow-down'}`}></i>
                       {displayData.technical_indicators.trend}
                     </span>
                   </div>
