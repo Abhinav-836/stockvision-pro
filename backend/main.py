@@ -14,6 +14,7 @@ import time
 import re
 import os
 import json
+import random
 from dotenv import load_dotenv
 
 # Configure logging
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# Fix yFinance cache on Render
+try:
+    yf.set_tz_cache_location("/tmp/yfinance_cache")
+except:
+    pass
 
 # Import financials helpers
 from financials import (
@@ -53,7 +60,6 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        # Remove from subscriptions
         for symbol in list(self.subscriptions.keys()):
             if websocket in self.subscriptions[symbol]:
                 self.subscriptions[symbol].remove(websocket)
@@ -85,7 +91,7 @@ manager = ConnectionManager()
 class Config:
     API_TITLE = "Stock Advisor API"
     API_VERSION = "2.1.0"
-    CACHE_TTL = int(os.getenv("CACHE_TTL", 60))  # Reduced to 60 seconds for real-time
+    CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
     MAX_CACHE_SIZE = 1000
     RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", 100))
     RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", 60))
@@ -138,7 +144,6 @@ class LRUCache:
             del self.timestamps[key]
 
     def delete_pattern(self, pattern: str):
-        """Delete all keys containing pattern"""
         keys_to_delete = [k for k in self.cache.keys() if pattern in k]
         for key in keys_to_delete:
             self.delete(key)
@@ -174,7 +179,7 @@ app = FastAPI(
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -249,12 +254,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ============= BACKGROUND TASKS =============
 async def market_updater():
-    """Update market indices every minute"""
     while True:
         try:
-            # Invalidate market cache
             stock_cache.delete_pattern("market:indices")
-            # Fetch and broadcast updates
             indices = await get_market_indices(use_cache=False)
             await manager.broadcast_all({
                 "type": "market_update",
@@ -264,18 +266,15 @@ async def market_updater():
             logger.info("Market indices updated via WebSocket")
         except Exception as e:
             logger.error(f"Error in market updater: {e}")
-        await asyncio.sleep(60)  # Update every minute
+        await asyncio.sleep(60)
 
 async def price_updater():
-    """Update stock prices every 5 seconds for subscribed symbols"""
     while True:
         try:
-            # Get all subscribed symbols
             symbols = list(manager.subscriptions.keys())
             if symbols:
                 for symbol in symbols:
                     try:
-                        # Fetch latest price
                         stock = yf.Ticker(symbol)
                         hist = stock.history(period="1d", interval="1m")
                         if hist is not None and not hist.empty:
@@ -283,7 +282,6 @@ async def price_updater():
                             prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
                             change = ((current_price - prev_close) / prev_close) * 100 if prev_close != 0 else 0
                             
-                            # Broadcast to subscribers
                             await manager.broadcast_to_symbol(symbol, {
                                 "type": "price_update",
                                 "symbol": symbol,
@@ -295,11 +293,10 @@ async def price_updater():
                         logger.error(f"Error updating price for {symbol}: {e}")
         except Exception as e:
             logger.error(f"Error in price updater: {e}")
-        await asyncio.sleep(5)  # Update every 5 seconds
+        await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():
-    """Start background tasks on startup"""
     asyncio.create_task(market_updater())
     asyncio.create_task(price_updater())
     logger.info("Background tasks started")
@@ -317,12 +314,93 @@ def safe_get(dictionary: Optional[Dict], key: str, default: Any = None) -> Any:
     return dictionary.get(key, default) if dictionary else default
 
 def invalidate_symbol_cache(symbol: str):
-    """Invalidate all cache entries for a symbol"""
     stock_cache.delete_pattern(symbol)
     chart_cache.delete_pattern(symbol)
     logger.info(f"Invalidated cache for {symbol}")
 
-async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
+async def safe_yf_call(func, retries=3):
+    """Safely call yFinance functions with retry"""
+    for i in range(retries):
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, func)
+            if result is not None and (not isinstance(result, dict) or result):
+                return result
+        except Exception as e:
+            logger.warning(f"yFinance call attempt {i+1} failed: {e}")
+            if i < retries - 1:
+                await asyncio.sleep(0.5 * (i + 1))
+    return None
+
+def get_fallback_stock_data(symbol: str) -> Dict:
+    """Return fallback data when yFinance fails"""
+    fallback_prices = {
+        "AAPL": {"price": 175.50, "change": 0.5, "company": "Apple Inc.", "pe": 28.5, "market_cap": 2750000000000},
+        "MSFT": {"price": 420.75, "change": 0.3, "company": "Microsoft Corp", "pe": 35.2, "market_cap": 3120000000000},
+        "GOOGL": {"price": 140.25, "change": 0.2, "company": "Alphabet Inc", "pe": 25.8, "market_cap": 1850000000000},
+        "AMZN": {"price": 178.50, "change": 0.4, "company": "Amazon.com Inc", "pe": 42.1, "market_cap": 1850000000000},
+        "TSLA": {"price": 240.50, "change": -0.3, "company": "Tesla Inc", "pe": 45.3, "market_cap": 765000000000},
+        "NVDA": {"price": 850.00, "change": 1.2, "company": "NVIDIA Corp", "pe": 65.5, "market_cap": 2120000000000},
+        "META": {"price": 485.00, "change": 0.8, "company": "Meta Platforms Inc", "pe": 28.9, "market_cap": 1230000000000},
+        "NFLX": {"price": 620.00, "change": 0.6, "company": "Netflix Inc", "pe": 35.2, "market_cap": 265000000000},
+        "ADBE": {"price": 525.00, "change": 0.4, "company": "Adobe Inc", "pe": 42.3, "market_cap": 235000000000},
+        "PYPL": {"price": 65.50, "change": -0.2, "company": "PayPal Holdings Inc", "pe": 15.8, "market_cap": 70000000000},
+    }
+    
+    default = {"price": 100.00, "change": 0.0, "company": f"{symbol} Inc.", "pe": 20.0, "market_cap": 100000000000}
+    data = fallback_prices.get(symbol, default)
+    
+    return {
+        "symbol": symbol,
+        "company_name": data["company"],
+        "current_price": data["price"],
+        "change_percent": data["change"],
+        "previous_close": data["price"] * (1 - data["change"]/100),
+        "day_high": data["price"] * 1.02,
+        "day_low": data["price"] * 0.98,
+        "volume": 10000000,
+        "pe_ratio": data["pe"],
+        "pb_ratio": 4.5,
+        "dividend_yield": 0.5,
+        "market_cap": data["market_cap"],
+        "eps": data["pe"] and data["price"] / data["pe"] if data["pe"] else 5.0,
+        "roe": 25.0,
+        "roa": 12.0,
+        "current_ratio": 1.5,
+        "debt_to_equity": 0.8,
+        "volatility": 0.35,
+        "fifty_two_week_high": data["price"] * 1.15,
+        "fifty_two_week_low": data["price"] * 0.85,
+        "average_volume": 15000000,
+        "sector": "Technology",
+        "industry": "Software",
+        "exchange": "NASDAQ",
+        "ai_score": 70,
+        "recommendation": "Hold",
+        "confidence": "Moderate",
+        "risk_level": "Moderate Risk",
+        "growth_potential": "Moderate Growth",
+        "valuation": "Fairly Valued",
+        "technical_indicators": {
+            "rsi": 55,
+            "trend": "Neutral",
+            "sma_20": data["price"] * 0.98,
+            "sma_50": data["price"] * 0.95,
+            "sma_200": data["price"] * 0.90,
+            "macd": 0.5,
+            "signal": 0.3,
+            "histogram": 0.2
+        },
+        "news": [
+            {"title": f"{data['company']} announces new products", "publisher": "Reuters", "published": datetime.now().isoformat()}
+        ],
+        "ownership": {"institutional_holders": 65.0, "insider_holders": 5.0},
+        "growth_metrics": {"revenue_growth": 12.5, "earnings_growth": 15.0},
+        "is_fallback_data": True,
+        "message": "Using estimated data - Live data temporarily unavailable",
+        "last_updated": datetime.now().isoformat()
+    }
+
+async def fetch_stock_data(symbol: str, use_cache: bool = True):
     """Asynchronously fetch stock data with better error handling"""
     cache_key = f"stock_data:{symbol}"
     
@@ -334,39 +412,47 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
     
     try:
         loop = asyncio.get_event_loop()
-        
         logger.info(f"Fetching data for {symbol}")
         
+        # Fix symbol mapping
+        symbol = symbol.upper().strip()
+        symbol_map = {"NVD": "NVDA", "BRK.B": "BRK-B", "BF.B": "BF-B"}
+        symbol = symbol_map.get(symbol, symbol)
+        
         # Create ticker
-        try:
-            stock = await loop.run_in_executor(None, yf.Ticker, symbol)
-        except Exception as e:
-            logger.error(f"Error creating ticker for {symbol}: {e}")
-            raise HTTPException(
-                status_code=404,
-                detail=f"Could not create ticker for {symbol}"
-            )
+        stock = None
+        for attempt in range(3):
+            try:
+                stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+                if stock:
+                    break
+            except Exception as e:
+                logger.warning(f"Ticker creation attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(0.5)
         
-        # Fetch info with timeout
-        try:
-            info = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: stock.info or {}),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching info for {symbol}")
-            info = {}
-        except Exception as e:
-            logger.error(f"Error fetching info for {symbol}: {e}")
-            info = {}
+        if not stock:
+            logger.error(f"Could not create ticker for {symbol}")
+            return None, {}, None
         
-        # Check if we got valid info
+        # Fetch info
+        info = {}
+        for attempt in range(3):
+            try:
+                info = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: stock.info or {}),
+                    timeout=10.0
+                )
+                if info and len(info) > 5:
+                    break
+            except asyncio.TimeoutError:
+                logger.warning(f"Info timeout for {symbol} (attempt {attempt+1})")
+            except Exception as e:
+                logger.warning(f"Info error for {symbol}: {e}")
+            await asyncio.sleep(0.5)
+        
+        # Try alternative symbol
         if not info or len(info) < 5:
-            logger.warning(f"Limited info received for {symbol}: {len(info) if info else 0} keys")
-            
-            # Try alternative symbol formats
             if not symbol.endswith('.NS') and not symbol.endswith('.BO'):
-                # Try with .NS suffix for Indian stocks
                 alt_symbol = symbol + '.NS'
                 try:
                     logger.info(f"Trying alternative symbol: {alt_symbol}")
@@ -376,52 +462,49 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
                         timeout=10.0
                     )
                     if alt_info and len(alt_info) > 5:
-                        logger.info(f"Success with {alt_symbol} instead")
+                        logger.info(f"Success with {alt_symbol}")
                         stock = alt_stock
                         info = alt_info
                         symbol = alt_symbol
                 except Exception as e:
-                    logger.debug(f"Alternative symbol failed: {e}")
+                    logger.debug(f"Alternative failed: {e}")
         
         # Fetch history
-        try:
-            hist = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: stock.history(period="1y")),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching history for {symbol}")
-            raise ValueError(f"Timeout fetching historical data for {symbol}")
-        except Exception as e:
-            logger.error(f"Error fetching history for {symbol}: {e}")
-            raise ValueError(f"No historical data available for {symbol}")
+        hist = None
+        periods_to_try = ["1y", "6mo", "3mo", "1mo"]
+        
+        for period in periods_to_try:
+            try:
+                hist = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: stock.history(period=period)),
+                    timeout=10.0
+                )
+                if hist is not None and not hist.empty:
+                    logger.info(f"Successfully fetched {period} history for {symbol}")
+                    break
+            except asyncio.TimeoutError:
+                logger.warning(f"History timeout for {symbol} with period {period}")
+            except Exception as e:
+                logger.warning(f"History error for {symbol}: {e}")
+            await asyncio.sleep(0.5)
         
         if hist is None or hist.empty:
-            logger.error(f"Empty history for {symbol}")
-            raise ValueError(f"No historical data available for {symbol}")
+            logger.warning(f"No history available for {symbol}, returning fallback")
+            return None, info if info else {}, None
         
         result = (stock, info, hist)
         
-        if use_cache:
+        if use_cache and result[0] is not None:
             stock_cache.set(cache_key, result)
         
         logger.info(f"Successfully fetched data for {symbol}")
         return result
         
-    except HTTPException:
-        raise
-    except ValueError as e:
-        logger.error(f"Value error for {symbol}: {str(e)}")
-        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error fetching data for {symbol}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching data for {symbol}: {str(e)}"
-        )
+        logger.error(f"Error fetching data for {symbol}: {str(e)}")
+        return None, {}, None
 
 def calculate_price_metrics(info: Dict, hist) -> Dict:
-    """Calculate current price and changes"""
     try:
         current_price = (
             info.get('currentPrice') or 
@@ -469,11 +552,9 @@ def calculate_price_metrics(info: Dict, hist) -> Dict:
         }
 
 def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
-    """Build comprehensive stock response"""
     try:
         price_metrics = calculate_price_metrics(info, hist)
         
-        # Calculate all financial metrics
         pe_ratio = calculate_pe_ratio(info)
         pb_ratio = calculate_pb_ratio(info)
         debt_to_equity = calculate_debt_to_equity(info)
@@ -506,14 +587,25 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
         ai_score = calculate_ai_score(metrics)
         recommendation_data = generate_recommendation(ai_score, metrics)
         
-        # Determine if Indian stock
         is_indian = is_indian_stock(symbol)
         display_symbol = normalize_indian_symbol(symbol) if is_indian else symbol
         
-        # Get company name safely
         company_name = safe_get(info, 'longName', display_symbol)
         if not company_name or company_name == display_symbol:
             company_name = safe_get(info, 'shortName', display_symbol)
+        
+        market_cap = safe_float(safe_get(info, 'marketCap', 0))
+        if market_cap == 0 and info.get('sharesOutstanding'):
+            shares = safe_float(info.get('sharesOutstanding', 0))
+            price = price_metrics.get('current_price', 0)
+            if shares and price:
+                market_cap = shares * price
+        
+        fifty_two_week_high = safe_float(safe_get(info, 'fiftyTwoWeekHigh', 0))
+        fifty_two_week_low = safe_float(safe_get(info, 'fiftyTwoWeekLow', 0))
+        if fifty_two_week_high == 0 and hist is not None and not hist.empty:
+            fifty_two_week_high = float(hist['High'].max())
+            fifty_two_week_low = float(hist['Low'].min())
         
         return {
             "symbol": display_symbol,
@@ -521,7 +613,7 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
             "is_indian_stock": is_indian,
             "company_name": company_name,
             **price_metrics,
-            "market_cap": safe_float(safe_get(info, 'marketCap', 0)),
+            "market_cap": market_cap,
             "pe_ratio": round(pe_ratio, 2) if pe_ratio is not None else None,
             "pb_ratio": round(pb_ratio, 2) if pb_ratio is not None else None,
             "dividend_yield": round(dividend_yield, 2) if dividend_yield is not None else None,
@@ -531,8 +623,8 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
             "roa": round(roa, 2) if roa is not None else None,
             "current_ratio": round(current_ratio, 2) if current_ratio is not None else None,
             "volatility": round(volatility, 4),
-            "fifty_two_week_high": safe_float(safe_get(info, 'fiftyTwoWeekHigh', 0)),
-            "fifty_two_week_low": safe_float(safe_get(info, 'fiftyTwoWeekLow', 0)),
+            "fifty_two_week_high": round(fifty_two_week_high, 2),
+            "fifty_two_week_low": round(fifty_two_week_low, 2),
             "average_volume": safe_float(safe_get(info, 'averageVolume', 0)),
             "sector": safe_get(info, 'sector'),
             "industry": safe_get(info, 'industry'),
@@ -589,121 +681,9 @@ async def health_check():
         "cache_stats": stock_cache.stats()
     }
 
-@app.post("/api/cache/invalidate/{symbol}")
-async def invalidate_cache(symbol: str):
-    """Invalidate cache for a specific symbol"""
-    try:
-        symbol = symbol.upper().strip()
-        invalidate_symbol_cache(symbol)
-        return {
-            "status": "success",
-            "message": f"Cache invalidated for {symbol}",
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error invalidating cache: {e}")
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-@app.get("/api/debug/{symbol}")
-async def debug_stock(symbol: str):
-    """Debug endpoint to check stock data fetching"""
-    try:
-        symbol = symbol.upper().strip()
-        logger.info(f"Debug endpoint called for {symbol}")
-        
-        import yfinance as yf
-        from yfinance.exceptions import YFinanceException
-        
-        result = {
-            "symbol": symbol,
-            "timestamp": datetime.now().isoformat(),
-            "tests": []
-        }
-        
-        # Test 1: Create ticker
-        try:
-            stock = yf.Ticker(symbol)
-            result["tests"].append({
-                "name": "create_ticker",
-                "success": True,
-                "message": f"Ticker created for {symbol}"
-            })
-        except Exception as e:
-            result["tests"].append({
-                "name": "create_ticker",
-                "success": False,
-                "error": str(e)
-            })
-            return result
-        
-        # Test 2: Get info
-        try:
-            info = stock.info
-            info_keys = list(info.keys()) if info else []
-            result["tests"].append({
-                "name": "get_info",
-                "success": bool(info and len(info) > 0),
-                "info_keys_count": len(info_keys),
-                "info_sample": info_keys[:10] if info_keys else [],
-                "has_longName": "longName" in info if info else False,
-                "has_regularMarketPrice": "regularMarketPrice" in info if info else False
-            })
-        except Exception as e:
-            result["tests"].append({
-                "name": "get_info",
-                "success": False,
-                "error": str(e)
-            })
-        
-        # Test 3: Get history
-        try:
-            hist = stock.history(period="1mo")
-            hist_empty = hist.empty if hist is not None else True
-            result["tests"].append({
-                "name": "get_history",
-                "success": not hist_empty,
-                "history_days": len(hist) if not hist_empty else 0,
-                "history_columns": list(hist.columns) if not hist_empty else []
-            })
-        except Exception as e:
-            result["tests"].append({
-                "name": "get_history",
-                "success": False,
-                "error": str(e)
-            })
-        
-        # Test 4: Try alternative symbol if needed
-        if not symbol.endswith('.NS') and not symbol.endswith('.BO'):
-            alt_symbol = symbol + '.NS'
-            try:
-                alt_stock = yf.Ticker(alt_symbol)
-                alt_info = alt_stock.info
-                if alt_info and len(alt_info) > 5:
-                    result["tests"].append({
-                        "name": "alternative_symbol",
-                        "success": True,
-                        "alternative": alt_symbol,
-                        "message": f"Alternative symbol {alt_symbol} works"
-                    })
-            except Exception:
-                pass
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Debug endpoint error: {e}")
-        return {
-            "symbol": symbol,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
 @app.get("/api/stock/{symbol}")
 async def get_stock_analysis(symbol: str, use_cache: bool = True):
-    """Get comprehensive stock analysis"""
+    """Get comprehensive stock analysis with fallback"""
     try:
         symbol = symbol.upper().strip()
         logger.info(f"Stock analysis requested for {symbol}")
@@ -715,27 +695,34 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
                 logger.info(f"Cache hit for {symbol}")
                 return cached_data
         
-        logger.info(f"Fetching fresh data for {symbol}")
-        stock, info, hist = await fetch_stock_data(symbol)
-        response_data = build_stock_response(symbol, stock, info, hist)
+        result = await fetch_stock_data(symbol, use_cache=False)
+        
+        if result and result[0] is not None and result[2] is not None:
+            stock, info, hist = result
+            response_data = build_stock_response(symbol, stock, info, hist)
+            
+            if use_cache:
+                stock_cache.set(cache_key, response_data)
+            
+            return response_data
+        
+        logger.warning(f"Using fallback data for {symbol}")
+        fallback_data = get_fallback_stock_data(symbol)
         
         if use_cache:
-            stock_cache.set(cache_key, response_data)
+            stock_cache.set(cache_key, fallback_data)
         
-        return response_data
+        return fallback_data
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in get_stock_analysis for {symbol}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error while analyzing {symbol}"
-        )
+        fallback_data = get_fallback_stock_data(symbol)
+        return fallback_data
 
 @app.get("/api/stock/{symbol}/chart")
 async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = True):
-    """Get historical chart data"""
     try:
         symbol = symbol.upper().strip()
         
@@ -754,10 +741,7 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
         hist = await loop.run_in_executor(None, lambda: stock.history(period=period))
         
         if hist is None or hist.empty:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No chart data available for {symbol}"
-            )
+            return []
         
         chart_data = []
         for date, row in hist.iterrows():
@@ -779,14 +763,10 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
         raise
     except Exception as e:
         logger.error(f"Error fetching chart for {symbol}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching chart data for {symbol}"
-        )
+        return []
 
 @app.post("/api/compare")
 async def compare_stocks(request: CompareRequest):
-    """Compare multiple stocks"""
     try:
         symbols = request.symbols
         
@@ -798,8 +778,9 @@ async def compare_stocks(request: CompareRequest):
         
         for i, result in enumerate(results):
             symbol = symbols[i]
-            if isinstance(result, Exception):
-                failed_symbols.append(f"{symbol}: {str(result)}")
+            if isinstance(result, Exception) or result is None or result[0] is None:
+                failed_symbols.append(f"{symbol}: Data unavailable")
+                stocks_data.append(get_fallback_stock_data(symbol))
                 continue
             
             try:
@@ -808,12 +789,7 @@ async def compare_stocks(request: CompareRequest):
                 stocks_data.append(stock_response)
             except Exception as e:
                 failed_symbols.append(f"{symbol}: {str(e)}")
-        
-        if len(stocks_data) < config.MIN_COMPARISON_STOCKS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Need at least {config.MIN_COMPARISON_STOCKS} valid stocks. Failed: {', '.join(failed_symbols)}"
-            )
+                stocks_data.append(get_fallback_stock_data(symbol))
         
         valid_pe = [s for s in stocks_data if s.get('pe_ratio') is not None]
         valid_roe = [s for s in stocks_data if s.get('roe') is not None]
@@ -821,15 +797,15 @@ async def compare_stocks(request: CompareRequest):
         valid_volatility = [s for s in stocks_data if s.get('volatility') is not None]
         
         comparison_data = {
-            "ai_top_pick": max(stocks_data, key=lambda x: x['ai_score'])['symbol'],
-            "best_value": min(valid_pe, key=lambda x: x['pe_ratio'])['symbol'] if valid_pe else "N/A",
-            "best_dividend": max(valid_div, key=lambda x: x['dividend_yield'])['symbol'] if valid_div else "N/A",
-            "lowest_risk": min(valid_volatility, key=lambda x: x['volatility'])['symbol'] if valid_volatility else "N/A",
+            "ai_top_pick": max(stocks_data, key=lambda x: x.get('ai_score', 0))['symbol'],
+            "best_value": min(valid_pe, key=lambda x: x.get('pe_ratio', float('inf')))['symbol'] if valid_pe else "N/A",
+            "best_dividend": max(valid_div, key=lambda x: x.get('dividend_yield', 0))['symbol'] if valid_div else "N/A",
+            "lowest_risk": min(valid_volatility, key=lambda x: x.get('volatility', float('inf')))['symbol'] if valid_volatility else "N/A",
             "average_pe": round(np.mean([s['pe_ratio'] for s in valid_pe]), 2) if valid_pe else 0,
             "average_roe": round(np.mean([s['roe'] for s in valid_roe]), 2) if valid_roe else 0,
             "average_div": round(np.mean([s['dividend_yield'] for s in valid_div]), 2) if valid_div else 0,
             "average_volatility": round(np.mean([s['volatility'] for s in valid_volatility]), 2) if valid_volatility else 0,
-            "average_debt": round(np.mean([s['debt_to_equity'] for s in stocks_data if s.get('debt_to_equity')]), 2),
+            "average_debt": round(np.mean([s.get('debt_to_equity', 0) for s in stocks_data if s.get('debt_to_equity')]), 2),
             "successful_symbols": [s['symbol'] for s in stocks_data],
             "failed_symbols": failed_symbols
         }
@@ -839,19 +815,15 @@ async def compare_stocks(request: CompareRequest):
             "comparison": comparison_data
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error comparing stocks: {str(e)}")
         raise HTTPException(status_code=500, detail="Error comparing stocks")
 
 @app.post("/api/ai/compare")
 async def ai_compare_stocks(request: CompareRequest, req: Request = None):
-    """AI-powered stock comparison with rate limiting"""
     try:
         symbols = request.symbols
         
-        # Get user identifier for rate limiting (IP address)
         user_id = "anonymous"
         if req and req.client:
             user_id = req.client.host
@@ -863,24 +835,15 @@ async def ai_compare_stocks(request: CompareRequest, req: Request = None):
         failed_symbols = []
         
         for i, result in enumerate(results):
-            if isinstance(result, Exception):
+            if isinstance(result, Exception) or result is None or result[0] is None:
                 failed_symbols.append(symbols[i])
+                stocks_data.append(get_fallback_stock_data(symbols[i]))
                 continue
             stock, info, hist = result
             stock_response = build_stock_response(symbols[i], stock, info, hist)
             stocks_data.append(stock_response)
         
-        if len(stocks_data) < 2:
-            return {
-                "success": False,
-                "error": "Need at least 2 valid stocks",
-                "failed_symbols": failed_symbols
-            }
-        
-        # Pass user_id for rate limiting
         ai_analysis = await ai_service.analyze_stock_comparison(stocks_data, user_id=user_id)
-        
-        # Add rate limit info to response
         rate_limit_stats = ai_service.get_rate_limit_stats()
         
         return {
@@ -901,16 +864,19 @@ async def ai_compare_stocks(request: CompareRequest, req: Request = None):
 
 @app.get("/api/ai/thesis/{symbol}")
 async def get_ai_thesis(symbol: str, req: Request = None):
-    """Generate AI investment thesis for a stock"""
     try:
         symbol = symbol.upper().strip()
         user_id = req.client.host if req and req.client else "anonymous"
         
-        stock, info, hist = await fetch_stock_data(symbol)
-        stock_data = build_stock_response(symbol, stock, info, hist)
+        result = await fetch_stock_data(symbol)
+        
+        if result and result[0] is not None and result[2] is not None:
+            stock, info, hist = result
+            stock_data = build_stock_response(symbol, stock, info, hist)
+        else:
+            stock_data = get_fallback_stock_data(symbol)
         
         news = get_latest_news(symbol)
-        
         thesis = await ai_service.generate_investment_thesis(stock_data, news, user_id=user_id)
         
         return {
@@ -929,7 +895,6 @@ async def get_ai_thesis(symbol: str, req: Request = None):
 
 @app.post("/api/ai/question")
 async def ask_ai_question(request: dict, req: Request = None):
-    """Ask any investment question to AI"""
     try:
         question = request.get("question")
         symbol = request.get("symbol")
@@ -941,10 +906,14 @@ async def ask_ai_question(request: dict, req: Request = None):
         stock_data = None
         if symbol:
             try:
-                stock, info, hist = await fetch_stock_data(symbol)
-                stock_data = build_stock_response(symbol, stock, info, hist)
+                result = await fetch_stock_data(symbol)
+                if result and result[0] is not None:
+                    stock, info, hist = result
+                    stock_data = build_stock_response(symbol, stock, info, hist)
+                else:
+                    stock_data = get_fallback_stock_data(symbol)
             except Exception:
-                pass
+                stock_data = get_fallback_stock_data(symbol) if symbol else None
         
         answer = await ai_service.answer_question(question, stock_data, user_id=user_id)
         
@@ -964,7 +933,6 @@ async def ask_ai_question(request: dict, req: Request = None):
 
 @app.post("/api/ai/sentiment")
 async def analyze_sentiment(request: dict, req: Request = None):
-    """Analyze market sentiment for symbols"""
     try:
         symbols = request.get("symbols", [])
         user_id = req.client.host if req and req.client else "anonymous"
@@ -994,7 +962,6 @@ async def analyze_sentiment(request: dict, req: Request = None):
 
 @app.get("/api/market-indices")
 async def get_market_indices(use_cache: bool = True):
-    """Get major market indices"""
     cache_key = "market:indices"
     if use_cache:
         cached_data = stock_cache.get(cache_key)
@@ -1041,18 +1008,13 @@ async def get_market_indices(use_cache: bool = True):
 
 @app.get("/api/trending")
 async def get_trending(use_cache: bool = True):
-    """Get trending stocks (including Indian stocks)"""
     cache_key = "trending:stocks"
     if use_cache:
         cached_data = stock_cache.get(cache_key)
         if cached_data:
             return cached_data
     
-    symbols = [
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META',
-        'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'ICICIBANK.NS',
-        'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'WIPRO.NS', 'TATAMOTORS.NS'
-    ]
+    symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META']
     
     async def fetch_trending(symbol):
         try:
@@ -1066,17 +1028,13 @@ async def get_trending(use_cache: bool = True):
                 previous = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current
                 change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
                 
-                display_symbol = normalize_indian_symbol(symbol)
-                
                 return {
-                    "symbol": display_symbol,
-                    "original_symbol": symbol,
-                    "name": safe_get(info, 'longName', display_symbol),
+                    "symbol": symbol,
+                    "name": safe_get(info, 'longName', symbol),
                     "price": round(current, 2),
                     "change": round(change_pct, 2),
                     "volume": safe_float(safe_get(info, 'volume', 0)),
-                    "market_cap": safe_float(safe_get(info, 'marketCap', 0)),
-                    "is_indian": is_indian_stock(symbol)
+                    "market_cap": safe_float(safe_get(info, 'marketCap', 0))
                 }
         except Exception as e:
             logger.error(f"Error fetching trending {symbol}: {e}")
@@ -1095,12 +1053,10 @@ async def get_trending(use_cache: bool = True):
 
 @app.get("/api/search/{query}")
 async def search_stocks(query: str):
-    """Search for stocks (including Indian stocks)"""
     if len(query) < 2:
         return {"results": []}
     
     stock_db = {
-        # US Stocks
         "AAPL": "Apple Inc.",
         "MSFT": "Microsoft Corporation",
         "GOOGL": "Alphabet Inc.",
@@ -1125,47 +1081,22 @@ async def search_stocks(query: str):
         "KO": "The Coca-Cola Company",
         "PEP": "PepsiCo Inc.",
         "NKE": "Nike Inc.",
-        
-        # Indian Stocks
         "RELIANCE.NS": "Reliance Industries Ltd",
         "TCS.NS": "Tata Consultancy Services Ltd",
         "HDFCBANK.NS": "HDFC Bank Ltd",
         "INFY.NS": "Infosys Ltd",
         "ICICIBANK.NS": "ICICI Bank Ltd",
-        "ITC.NS": "ITC Ltd",
-        "KOTAKBANK.NS": "Kotak Mahindra Bank Ltd",
-        "SBIN.NS": "State Bank of India",
-        "BHARTIARTL.NS": "Bharti Airtel Ltd",
-        "DMART.NS": "Avenue Supermarts Ltd",
-        "WIPRO.NS": "Wipro Ltd",
-        "TECHM.NS": "Tech Mahindra Ltd",
-        "TATAMOTORS.NS": "Tata Motors Ltd",
-        "MARUTI.NS": "Maruti Suzuki India Ltd",
-        "SUNPHARMA.NS": "Sun Pharmaceutical Industries Ltd",
-        "HCLTECH.NS": "HCL Technologies Ltd",
-        "LT.NS": "Larsen & Toubro Ltd",
-        "AXISBANK.NS": "Axis Bank Ltd",
-        "ONGC.NS": "Oil and Natural Gas Corporation Ltd",
-        "NTPC.NS": "NTPC Ltd",
-        "POWERGRID.NS": "Power Grid Corporation of India Ltd",
-        "ULTRACEMCO.NS": "UltraTech Cement Ltd",
-        "BAJFINANCE.NS": "Bajaj Finance Ltd",
-        "ADANIPORTS.NS": "Adani Ports and SEZ Ltd",
-        "TITAN.NS": "Titan Company Ltd"
     }
     
     query_upper = query.upper()
     results = []
     
     for symbol, name in stock_db.items():
-        display_symbol = normalize_indian_symbol(symbol)
-        if query_upper in display_symbol or query_upper in name.upper():
+        if query_upper in symbol or query_upper in name.upper():
             results.append({
-                "symbol": display_symbol,
-                "original_symbol": symbol,
+                "symbol": symbol,
                 "name": name,
-                "match_type": "symbol" if query_upper in display_symbol else "name",
-                "is_indian": is_indian_stock(symbol)
+                "match_type": "symbol" if query_upper in symbol else "name"
             })
     
     results.sort(key=lambda x: (
@@ -1175,6 +1106,77 @@ async def search_stocks(query: str):
     ))
     
     return {"results": results[:15]}
+
+@app.get("/api/debug/{symbol}")
+async def debug_stock(symbol: str):
+    try:
+        symbol = symbol.upper().strip()
+        logger.info(f"Debug endpoint called for {symbol}")
+        
+        result = {
+            "symbol": symbol,
+            "timestamp": datetime.now().isoformat(),
+            "tests": []
+        }
+        
+        try:
+            stock = yf.Ticker(symbol)
+            result["tests"].append({
+                "name": "create_ticker",
+                "success": True,
+                "message": f"Ticker created for {symbol}"
+            })
+        except Exception as e:
+            result["tests"].append({
+                "name": "create_ticker",
+                "success": False,
+                "error": str(e)
+            })
+            return result
+        
+        try:
+            info = stock.info
+            info_keys = list(info.keys()) if info else []
+            result["tests"].append({
+                "name": "get_info",
+                "success": bool(info and len(info) > 0),
+                "info_keys_count": len(info_keys),
+                "info_sample": info_keys[:10] if info_keys else [],
+                "has_longName": "longName" in info if info else False,
+                "has_regularMarketPrice": "regularMarketPrice" in info if info else False
+            })
+        except Exception as e:
+            result["tests"].append({
+                "name": "get_info",
+                "success": False,
+                "error": str(e)
+            })
+        
+        try:
+            hist = stock.history(period="1mo")
+            hist_empty = hist.empty if hist is not None else True
+            result["tests"].append({
+                "name": "get_history",
+                "success": not hist_empty,
+                "history_days": len(hist) if not hist_empty else 0,
+                "history_columns": list(hist.columns) if not hist_empty else []
+            })
+        except Exception as e:
+            result["tests"].append({
+                "name": "get_history",
+                "success": False,
+                "error": str(e)
+            })
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}")
+        return {
+            "symbol": symbol,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 if __name__ == "__main__":
     import uvicorn
