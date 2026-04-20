@@ -45,7 +45,8 @@ async function fetchAPI(endpoint, options = {}) {
   
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    // FIXED: Increased timeout from 30s to 90s for Render cold starts
+    const timeoutId = setTimeout(() => controller.abort(), 90000);
 
     const response = await fetch(url, {
       ...options,
@@ -187,6 +188,18 @@ export async function clearCache() {
   console.log('Cache cleared');
 }
 
+// Add a wake-up function for Render cold starts
+export async function wakeUpBackend() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/health`, {
+      signal: AbortSignal.timeout(10000)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 export default {
   healthCheck,
   getMarketIndices,
@@ -194,5 +207,6 @@ export default {
   getStockChartData,
   compareStocks,
   getTrendingStocks,
-  clearCache
+  clearCache,
+  wakeUpBackend
 };
