@@ -81,12 +81,12 @@ yf_limiter = yFinanceRateLimiter(max_calls=8, time_window=60)
 
 
 # ---------------------------------------------------------------------------
-# WebSocket connection manager
+# WebSocket connection manager (DEFINED FIRST)
 # ---------------------------------------------------------------------------
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-        self.subscriptions: Dict[str, List[WebSocket]] = {}
+        self.subscriptions: Dict[str, set] = {}
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -95,16 +95,21 @@ class ConnectionManager:
     def disconnect(self, ws: WebSocket):
         if ws in self.active_connections:
             self.active_connections.remove(ws)
+        # Clean up from subscriptions
         for symbol in list(self.subscriptions.keys()):
             if ws in self.subscriptions[symbol]:
-                self.subscriptions[symbol].remove(ws)
+                self.subscriptions[symbol].discard(ws)
+                if not self.subscriptions[symbol]:
+                    del self.subscriptions[symbol]
 
     async def subscribe(self, ws: WebSocket, symbol: str):
-        self.subscriptions.setdefault(symbol, []).append(ws)
+        self.subscriptions.setdefault(symbol, set()).add(ws)
 
     async def broadcast_to_symbol(self, symbol: str, message: dict):
+        if symbol not in self.subscriptions:
+            return
         dead: List[WebSocket] = []
-        for ws in self.subscriptions.get(symbol, []):
+        for ws in self.subscriptions[symbol]:
             try:
                 await ws.send_json(message)
             except Exception:
@@ -123,6 +128,7 @@ class ConnectionManager:
             self.disconnect(ws)
 
 
+# Create global manager instance
 manager = ConnectionManager()
 
 
@@ -140,7 +146,7 @@ class Config:
     MIN_COMPARISON_STOCKS   = int(os.getenv("MIN_COMPARISON_STOCKS", 2))
     ALLOWED_ORIGINS         = os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://localhost:3000,https://stockvision-pro-sigma.vercel.app/"
+        "http://localhost:5173,http://localhost:3000,https://stockvision-pro-sigma.vercel.app"
     ).split(",")
     REDIS_HOST  = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT  = int(os.getenv("REDIS_PORT", 6379))
@@ -214,7 +220,7 @@ chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
 
 
 # ---------------------------------------------------------------------------
-# Background tasks
+# Background tasks (now manager is defined)
 # ---------------------------------------------------------------------------
 async def market_updater():
     """Refresh market indices every 60 s and push via WebSocket."""
@@ -363,7 +369,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif mtype == 'unsubscribe':
                     sym = msg.get('symbol', '').upper()
                     if sym in manager.subscriptions and websocket in manager.subscriptions[sym]:
-                        manager.subscriptions[sym].remove(websocket)
+                        manager.subscriptions[sym].discard(websocket)
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "error", "message": "Invalid JSON"})
     except WebSocketDisconnect:
@@ -405,16 +411,13 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
     loop = asyncio.get_event_loop()
     logger.info(f"Fetching fresh data for {symbol}")
     
-    # Apply rate limiting
     await yf_limiter.wait_if_needed()
 
-    # -- Ticker --------------------------------------------------------------
     try:
         stock = await loop.run_in_executor(None, yf.Ticker, symbol)
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Could not create ticker for {symbol}: {e}")
 
-    # -- Info ----------------------------------------------------------------
     try:
         info = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: stock.info or {}),
@@ -427,7 +430,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
         logger.error(f"Error fetching info for {symbol}: {e}")
         info = {}
 
-    # -- Auto-retry with .NS suffix for Indian stocks -----------------------
     if (not info or len(info) < 5) and not symbol.endswith(('.NS', '.BO')):
         alt = symbol + '.NS'
         try:
@@ -445,7 +447,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True) -> tuple:
         except Exception:
             pass
 
-    # -- History with retry on rate limit ------------------------------------
     max_retries = 3
     hist = None
     for attempt in range(max_retries):
@@ -819,14 +820,14 @@ async def ai_compare_stocks(request: CompareRequest, req: Request = None):
 
 @app.get("/api/ai/thesis/{symbol}")
 async def get_ai_thesis(symbol: str, req: Request = None):
-    """DeepSeek R1 investment thesis for a single stock."""
+    """DeepSeek R1 investment thesis for a single stock - FAST (no news fetching)."""
     symbol = symbol.upper().strip()
     user_id = req.client.host if req and req.client else "anonymous"
 
     stock, info, hist = await fetch_stock_data(symbol)
     stock_data = build_stock_response(symbol, stock, info, hist)
-    news = get_latest_news(symbol)
-    thesis = await ai_service.generate_investment_thesis(stock_data, news, user_id=user_id)
+    
+    thesis = await ai_service.generate_investment_thesis(stock_data, user_id=user_id)
 
     return {"success": True, "symbol": symbol, "thesis": thesis, "timestamp": datetime.now().isoformat()}
 

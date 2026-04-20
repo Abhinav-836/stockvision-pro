@@ -69,9 +69,9 @@ class RateLimiter:
 class OpenRouterAIService:
     """
     Wraps OpenRouter with:
-      - DeepSeek R1 as primary model  (best reasoning / financial analysis)
+      - DeepSeek R1 as primary model (best reasoning / financial analysis)
       - Llama 3.3 70B as first fallback (free tier)
-      - Mistral 7B as second fallback  (free tier)
+      - Mistral 7B as second fallback (free tier)
     """
 
     # Model identifiers -------------------------------------------------------
@@ -225,7 +225,7 @@ class OpenRouterAIService:
                         None,
                         lambda m=model: self._make_completion(m, messages, temperature, max_tokens),
                     ),
-                    timeout=8.0,  # R1 can be slow; give it 30 s
+                    timeout=30.0,  # R1 can be slow; give it 30 s
                 )
                 if response:
                     self._set_cache(cache_key, response)
@@ -327,14 +327,13 @@ class OpenRouterAIService:
         return self._fallback_comparison(stocks_data)
 
     async def generate_investment_thesis(
-        self, stock_data: Dict, news: List[Dict], user_id: str = "anonymous"
+        self, stock_data: Dict, user_id: str = "anonymous"
     ) -> Dict:
         """
         Generate a detailed investment thesis for a single stock.
         DeepSeek R1's reasoning capability shines here.
+        NEWS REMOVED for faster response times (8-15s instead of 25-40s)
         """
-        news_lines = "\n".join(f"- {n.get('title','')}" for n in news[:5]) or "No recent news."
-
         symbol  = stock_data.get("symbol", "N/A")
         company = stock_data.get("company_name", "N/A")
 
@@ -354,7 +353,6 @@ class OpenRouterAIService:
             f"  Volatility={stock_data.get('volatility','N/A')}\n"
             f"  AIScore={stock_data.get('ai_score','N/A')}/100\n"
             f"  Recommendation={stock_data.get('recommendation','N/A')}\n\n"
-            f"Recent News:\n{news_lines}\n\n"
             "Return a JSON object with these fields:\n"
             "- thesis: string (2–3 sentence investment thesis)\n"
             "- strengths: array of 3 strings\n"
@@ -445,7 +443,7 @@ class OpenRouterAIService:
         return self.rate_limiter.get_stats()
 
     # ------------------------------------------------------------------
-    # Rule-based fallbacks (unchanged logic, slightly cleaned up)
+    # Rule-based fallbacks
     # ------------------------------------------------------------------
 
     def _fallback_comparison(self, stocks_data: List[Dict]) -> Dict:
