@@ -55,8 +55,6 @@ def normalize_percentage(value: Optional[float]) -> Optional[float]:
     return None
 
 
-# backend/financials.py (CRITICAL FIXES)
-
 def normalize_dividend_yield(value: Optional[float]) -> Optional[float]:
     """
     BULLETPROOF dividend yield normalization.
@@ -429,7 +427,7 @@ def calculate_ai_score(metrics: Dict) -> float:
     pe = metrics.get('pe_ratio')
     pb = metrics.get('pb_ratio')
 
-    if pe is not None:
+    if pe is not None and isinstance(pe, (int, float)):
         if 10 <= pe <= 20:
             score += 15
         elif 20 < pe <= 25:
@@ -443,7 +441,7 @@ def calculate_ai_score(metrics: Dict) -> float:
         else:
             score += 2
 
-    if pb is not None:
+    if pb is not None and isinstance(pb, (int, float)):
         if is_tech:
             # Relaxed scoring for tech stocks
             if pb < 5:
@@ -472,7 +470,7 @@ def calculate_ai_score(metrics: Dict) -> float:
     roa = metrics.get('roa')
     eps = metrics.get('eps')
 
-    if roe is not None:
+    if roe is not None and isinstance(roe, (int, float)):
         if roe > 25:
             score += 10
         elif roe > 18:
@@ -484,7 +482,7 @@ def calculate_ai_score(metrics: Dict) -> float:
         else:
             score += 2
 
-    if roa is not None:
+    if roa is not None and isinstance(roa, (int, float)):
         if roa > 10:
             score += 8
         elif roa > 7:
@@ -494,7 +492,7 @@ def calculate_ai_score(metrics: Dict) -> float:
         elif roa > 2:
             score += 2
 
-    if eps is not None:
+    if eps is not None and isinstance(eps, (int, float)):
         if eps > 8:
             score += 7
         elif eps > 5:
@@ -508,7 +506,7 @@ def calculate_ai_score(metrics: Dict) -> float:
     de = metrics.get('debt_to_equity')
     cr = metrics.get('current_ratio')
 
-    if de is not None:
+    if de is not None and isinstance(de, (int, float)):
         if de < 0.3:
             score += 10
         elif de < 0.8:
@@ -520,7 +518,7 @@ def calculate_ai_score(metrics: Dict) -> float:
         else:
             score += 1
 
-    if cr is not None:
+    if cr is not None and isinstance(cr, (int, float)):
         if cr >= 2.5:
             score += 10
         elif cr >= 1.8:
@@ -534,7 +532,7 @@ def calculate_ai_score(metrics: Dict) -> float:
 
     # --- Income (10 pts) --------------------------------------------------
     div = metrics.get('dividend_yield')
-    if div is not None:
+    if div is not None and isinstance(div, (int, float)):
         if 2.0 <= div <= 6.0:
             score += 8
         elif 0.5 <= div < 2.0:
@@ -562,7 +560,7 @@ def calculate_ai_score(metrics: Dict) -> float:
     rsi = tech.get('rsi')
     trend = tech.get('trend', '')
 
-    if rsi is not None:
+    if rsi is not None and isinstance(rsi, (int, float)):
         if 45 <= rsi <= 55:
             score += 5
         elif 30 <= rsi <= 70:
@@ -637,7 +635,7 @@ def generate_recommendation(ai_score: float, metrics: Dict) -> Dict:
     sector = metrics.get('sector', '')
     is_tech = sector == 'Technology'
     
-    if pe is not None:
+    if pe is not None and isinstance(pe, (int, float)):
         if is_tech:
             if pe < 20:
                 valuation = "Undervalued"
@@ -683,4 +681,4 @@ def normalize_indian_symbol(symbol: str) -> str:
     for suffix in _INDIAN_SUFFIXES:
         if symbol.upper().endswith(suffix):
             return symbol[:-len(suffix)]
-    return symbol  # FIXED: added return
+    return symbol
