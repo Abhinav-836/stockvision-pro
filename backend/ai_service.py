@@ -225,7 +225,7 @@ class OpenRouterAIService:
                         None,
                         lambda m=model: self._make_completion(m, messages, temperature, max_tokens),
                     ),
-                    timeout=30.0,  # R1 can be slow; give it 30 s
+                    timeout=8.0,  # R1 can be slow; give it 30 s
                 )
                 if response:
                     self._set_cache(cache_key, response)
