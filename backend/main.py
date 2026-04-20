@@ -91,7 +91,7 @@ class Config:
     RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", 60))
     MAX_COMPARISON_STOCKS = int(os.getenv("MAX_COMPARISON_STOCKS", 5))
     MIN_COMPARISON_STOCKS = int(os.getenv("MIN_COMPARISON_STOCKS", 2))
-    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
     REDIS_DB = int(os.getenv("REDIS_DB", 0))
