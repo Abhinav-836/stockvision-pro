@@ -94,16 +94,16 @@ class OpenRouterAIService:
         
         # Initialize rate limiter - conservative limits for free tier
         self.rate_limiter = RateLimiter(
-            max_requests=20,  # Max 20 requests per minute per user
+            max_requests=10,  # Reduced from 20 to be more conservative
             time_window=60
         )
         
         self.cache = {}
-        self.cache_ttl = int(os.getenv("CACHE_TTL", 600))  # Increased cache time to 10 minutes
+        self.cache_ttl = int(os.getenv("CACHE_TTL", 900))  # Increased cache time to 15 minutes
         self.user_request_count = defaultdict(int)
         
         logger.info(f"✅ OpenRouter AI Service initialized with model: {self.model}")
-        logger.info(f"✅ Rate limiting: 20 requests/minute/user, {self.rate_limiter.daily_limit} requests/day total")
+        logger.info(f"✅ Rate limiting: 10 requests/minute/user, {self.rate_limiter.daily_limit} requests/day total")
 
     async def query_with_retry(self, 
                               prompt: str, 

@@ -45,8 +45,8 @@ async function fetchAPI(endpoint, options = {}) {
   
   try {
     const controller = new AbortController();
-    // FIXED: Increased timeout from 30s to 90s for Render cold starts
-    const timeoutId = setTimeout(() => controller.abort(), 90000);
+    // FIXED: Increased timeout to 30s 
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
 
     const response = await fetch(url, {
       ...options,

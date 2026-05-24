@@ -9,7 +9,7 @@ import yfinance as yf
 import numpy as np
 import asyncio
 import logging
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import time
 import re
 import os
@@ -46,6 +46,60 @@ from financials import (
 
 # Import AI service
 from ai_service import ai_service
+
+# ============= RATE LIMITER FOR YFINANCE =============
+class YFinanceRateLimiter:
+    def __init__(self, max_calls_per_minute=25):
+        self.calls = []
+        self.max_calls = max_calls_per_minute
+        self.lock = asyncio.Lock()
+    
+    async def acquire(self):
+        async with self.lock:
+            now = time.time()
+            # Remove calls older than 60 seconds
+            self.calls = [t for t in self.calls if now - t < 60]
+            
+            if len(self.calls) >= self.max_calls:
+                wait_time = 60 - (now - self.calls[0]) + 0.5
+                if wait_time > 0:
+                    logger.info(f"Rate limit reached, waiting {wait_time:.1f} seconds")
+                    await asyncio.sleep(wait_time)
+            
+            self.calls.append(time.time())
+
+# ============= REQUEST COALESCER =============
+class RequestCoalescer:
+    """Prevents duplicate API calls for same symbol"""
+    
+    def __init__(self):
+        self.pending = {}
+        self.cache = {}
+        self.cache_ttl = 30  # 30 seconds cache for same symbol
+    
+    async def get_or_fetch(self, symbol: str, fetcher_func):
+        """Get data for symbol, coalescing concurrent requests"""
+        
+        # Check memory cache first
+        if symbol in self.cache:
+            data, timestamp = self.cache[symbol]
+            if time.time() - timestamp < self.cache_ttl:
+                return data
+        
+        # If there's already a pending request for this symbol, wait for it
+        if symbol in self.pending:
+            return await self.pending[symbol]
+        
+        # Create new request
+        future = asyncio.create_task(fetcher_func(symbol))
+        self.pending[symbol] = future
+        
+        try:
+            result = await future
+            self.cache[symbol] = (result, time.time())
+            return result
+        finally:
+            del self.pending[symbol]
 
 # ============= WEBSOCKET MANAGER =============
 class ConnectionManager:
@@ -163,9 +217,14 @@ class LRUCache:
             "max_size": self.max_size
         }
 
-# Initialize caches
+# Initialize caches and rate limiters
 stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
 chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
+yf_rate_limiter = YFinanceRateLimiter(max_calls_per_minute=25)
+request_coalescer = RequestCoalescer()
+
+# Global request counts for middleware
+request_counts = defaultdict(list)
 
 # ============= FASTAPI APP =============
 app = FastAPI(
@@ -184,6 +243,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============= RATE LIMIT MIDDLEWARE =============
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Global rate limiting for all endpoints"""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    # Clean old requests
+    request_counts[client_ip] = [t for t in request_counts[client_ip] if now - t < 60]
+    
+    # 60 requests per minute per IP
+    if len(request_counts[client_ip]) >= 60:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Please try again in a minute."}
+        )
+    
+    request_counts[client_ip].append(now)
+    
+    # Add rate limit headers
+    response = await call_next(request)
+    response.headers["X-RateLimit-Limit"] = "60"
+    response.headers["X-RateLimit-Remaining"] = str(60 - len(request_counts[client_ip]))
+    
+    return response
 
 # ============= VALIDATION MODELS =============
 class StockRequest(BaseModel):
@@ -254,6 +339,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ============= BACKGROUND TASKS =============
 async def market_updater():
+    """Update market indices with rate limiting"""
     while True:
         try:
             stock_cache.delete_pattern("market:indices")
@@ -269,31 +355,84 @@ async def market_updater():
         await asyncio.sleep(60)
 
 async def price_updater():
+    """Optimized price updates with rate limit protection"""
+    last_prices = {}
+    consecutive_failures = defaultdict(int)
+    backoff_times = defaultdict(int)
+    
     while True:
         try:
             symbols = list(manager.subscriptions.keys())
             if symbols:
-                for symbol in symbols:
-                    try:
-                        stock = yf.Ticker(symbol)
-                        hist = stock.history(period="1d", interval="1m")
-                        if hist is not None and not hist.empty:
-                            current_price = float(hist['Close'].iloc[-1])
-                            prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
-                            change = ((current_price - prev_close) / prev_close) * 100 if prev_close != 0 else 0
+                # Process symbols in small batches with delays
+                batch_size = 3  # Smaller batch to avoid rate limits
+                
+                for i in range(0, len(symbols), batch_size):
+                    batch = symbols[i:i+batch_size]
+                    
+                    for symbol in batch:
+                        # Check if we should back off for this symbol
+                        if backoff_times[symbol] > time.time():
+                            continue
+                        
+                        try:
+                            # Add small delay between requests
+                            await asyncio.sleep(0.2)
                             
-                            await manager.broadcast_to_symbol(symbol, {
-                                "type": "price_update",
-                                "symbol": symbol,
-                                "price": round(current_price, 2),
-                                "change": round(change, 2),
-                                "timestamp": datetime.now().isoformat()
-                            })
-                    except Exception as e:
-                        logger.error(f"Error updating price for {symbol}: {e}")
+                            await yf_rate_limiter.acquire()
+                            
+                            loop = asyncio.get_event_loop()
+                            stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+                            
+                            # Use 5m interval - good balance between freshness and API load
+                            hist = await loop.run_in_executor(
+                                None, 
+                                lambda: stock.history(period="1d", interval="5m")
+                            )
+                            
+                            if hist is not None and not hist.empty:
+                                current_price = float(hist['Close'].iloc[-1])
+                                prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
+                                change = ((current_price - prev_close) / prev_close) * 100 if prev_close != 0 else 0
+                                
+                                # Only broadcast if price changed significantly
+                                last_price = last_prices.get(symbol, current_price)
+                                price_change = abs(current_price - last_price)
+                                
+                                if price_change > 0.05 or change > 0.5:  # 5 cents or 0.5% change
+                                    await manager.broadcast_to_symbol(symbol, {
+                                        "type": "price_update",
+                                        "symbol": symbol,
+                                        "price": round(current_price, 2),
+                                        "change": round(change, 2),
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                                    last_prices[symbol] = current_price
+                                    
+                                    # Reset failure counter on success
+                                    consecutive_failures[symbol] = 0
+                                    backoff_times[symbol] = 0
+                            else:
+                                # Track failures for backoff
+                                consecutive_failures[symbol] += 1
+                                if consecutive_failures[symbol] >= 3:
+                                    backoff_times[symbol] = time.time() + 60  # Back off for 60 seconds
+                                    logger.warning(f"Backing off updates for {symbol} due to failures")
+                                    
+                        except Exception as e:
+                            logger.debug(f"Price update error for {symbol}: {e}")
+                            consecutive_failures[symbol] += 1
+                    
+                    # Wait between batches to avoid rate limiting
+                    await asyncio.sleep(1)
+            
+            # Dynamic update interval based on active symbols
+            update_interval = 10 if len(symbols) > 10 else 5
+            await asyncio.sleep(update_interval)
+            
         except Exception as e:
             logger.error(f"Error in price updater: {e}")
-        await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
 @app.on_event("startup")
 async def startup_event():
@@ -411,6 +550,8 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             return cached_data
     
     try:
+        await yf_rate_limiter.acquire()
+        
         loop = asyncio.get_event_loop()
         logger.info(f"Fetching data for {symbol}")
         
@@ -723,43 +864,59 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
 
 @app.get("/api/stock/{symbol}/chart")
 async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = True):
+    """Get chart data with smart caching and rate limiting"""
     try:
         symbol = symbol.upper().strip()
         
-        valid_periods = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
+        valid_periods = ["1d", "5d", "1mo", "3mo", "6mo", "1y"]
         if period not in valid_periods:
             period = "1mo"
         
         cache_key = f"chart:{symbol}:{period}"
+        
         if use_cache:
             cached_data = chart_cache.get(cache_key)
             if cached_data:
                 return cached_data
         
-        # Generate mock chart data if real data fails
-        try:
-            loop = asyncio.get_event_loop()
-            stock = await loop.run_in_executor(None, yf.Ticker, symbol)
-            hist = await loop.run_in_executor(None, lambda: stock.history(period=period))
+        # Use rate limiter
+        await yf_rate_limiter.acquire()
+        
+        loop = asyncio.get_event_loop()
+        
+        # Use interval based on period to reduce data points
+        interval = "1d" if period in ["1mo", "3mo", "6mo", "1y"] else "1h"
+        
+        stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+        hist = await loop.run_in_executor(
+            None, 
+            lambda: stock.history(period=period, interval=interval)
+        )
+        
+        if hist is not None and not hist.empty:
+            # Limit data points for better performance
+            max_points = 100
+            if len(hist) > max_points:
+                hist = hist.iloc[-max_points:]  # Take last N points
             
-            if hist is not None and not hist.empty:
-                chart_data = []
-                for date, row in hist.iterrows():
-                    chart_data.append({
-                        "date": date.isoformat(),
-                        "price": round(float(row['Close']), 2),
-                        "open": round(float(row['Open']), 2),
-                        "high": round(float(row['High']), 2),
-                        "low": round(float(row['Low']), 2),
-                        "volume": int(row['Volume']) if 'Volume' in row else 0
-                    })
-                
-                if use_cache:
-                    chart_cache.set(cache_key, chart_data)
-                
-                return chart_data
-        except Exception as e:
-            logger.warning(f"Could not fetch real chart for {symbol}: {e}")
+            chart_data = []
+            for date, row in hist.iterrows():
+                chart_data.append({
+                    "date": date.isoformat(),
+                    "price": round(float(row['Close']), 2),
+                    "open": round(float(row['Open']), 2),
+                    "high": round(float(row['High']), 2),
+                    "low": round(float(row['Low']), 2),
+                    "volume": int(row['Volume']) if 'Volume' in row else 0
+                })
+            
+            if use_cache:
+                # Cache for 5 minutes for older periods, 1 minute for recent
+                ttl = 60 if period == "1d" else 300
+                # Use custom TTL by setting directly
+                chart_cache.set(cache_key, chart_data)
+            
+            return chart_data
         
         # Generate mock chart data for fallback
         import random
@@ -993,97 +1150,124 @@ async def analyze_sentiment(request: dict, req: Request = None):
 
 @app.get("/api/market-indices")
 async def get_market_indices(use_cache: bool = True):
-    """Get major market indices with real-time data and fallback"""
+    """Get major market indices with real-time data and rate limiting"""
     cache_key = "market:indices"
+    
     if use_cache:
         cached_data = stock_cache.get(cache_key)
         if cached_data:
-            return cached_data
+            # Check if cache is still fresh (2 minutes for indices)
+            if hasattr(cached_data, '_timestamp'):
+                if time.time() - cached_data._timestamp < 120:
+                    return cached_data
     
-    # Real-time approximate market values (updated daily)
-    fallback_indices = {
-        '^GSPC': {'name': 'S&P 500', 'value': 5180.50, 'change': 0.35},
-        '^IXIC': {'name': 'NASDAQ', 'value': 16250.25, 'change': 0.42},
-        '^DJI': {'name': 'DOW JONES', 'value': 38750.75, 'change': 0.28},
-        '^RUT': {'name': 'RUSSELL 2000', 'value': 2050.30, 'change': 0.15},
-        '^VIX': {'name': 'VIX', 'value': 14.25, 'change': -2.10},
-        'BTC-USD': {'name': 'Bitcoin', 'value': 62500.00, 'change': 1.25},
-        'GC=F': {'name': 'Gold', 'value': 2350.50, 'change': 0.45},
-        'CL=F': {'name': 'Crude Oil', 'value': 78.50, 'change': -0.75}
-    }
-    
+    # Define indices with proper yFinance symbols
     indices_config = {
         '^GSPC': 'S&P 500',
         '^IXIC': 'NASDAQ',
         '^DJI': 'DOW JONES',
         '^RUT': 'RUSSELL 2000',
         '^VIX': 'VIX',
+        '^NSEI': 'NIFTY 50',
+        '^BSESN': 'SENSEX',
         'BTC-USD': 'Bitcoin',
         'GC=F': 'Gold',
         'CL=F': 'Crude Oil'
     }
     
-    async def fetch_index(symbol, name):
-        try:
-            loop = asyncio.get_event_loop()
-            stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+    # Use asyncio.gather with semaphore for rate limiting
+    semaphore = asyncio.Semaphore(3)  # Only 3 concurrent requests
+    
+    async def fetch_index_with_limit(symbol, name):
+        async with semaphore:
+            return await fetch_single_index(symbol, name)
+    
+    tasks = [fetch_index_with_limit(symbol, name) for symbol, name in indices_config.items()]
+    indices_data = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process results
+    valid_indices = []
+    for result in indices_data:
+        if isinstance(result, Exception):
+            logger.warning(f"Index fetch failed: {result}")
+            continue
+        if result:
+            valid_indices.append(result)
+    
+    # If we got less than 50% of indices, use cached/fallback
+    if len(valid_indices) < len(indices_config) * 0.5:
+        cached_data = stock_cache.get(cache_key)
+        if cached_data:
+            logger.info("Using cached indices due to low success rate")
+            return cached_data
+    
+    # Cache for 2 minutes
+    if use_cache and valid_indices:
+        # Add timestamp to cached data
+        valid_indices._timestamp = time.time()
+        stock_cache.set(cache_key, valid_indices)
+    
+    return valid_indices
+
+async def fetch_single_index(symbol: str, name: str) -> Optional[Dict]:
+    """Fetch single index with proper error handling and rate limiting"""
+    try:
+        # Small delay between requests to be nice to yFinance
+        await asyncio.sleep(0.1)
+        
+        # Apply rate limiting
+        await yf_rate_limiter.acquire()
+        
+        loop = asyncio.get_event_loop()
+        stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+        
+        # Try to get info first (fast path)
+        info = await loop.run_in_executor(None, lambda: stock.info or {})
+        
+        if info:
+            # Try multiple price fields
+            current = (info.get('regularMarketPrice') or 
+                      info.get('currentPrice') or 
+                      info.get('previousClose'))
             
-            # Try to get real-time data
-            try:
-                info = stock.info
-                current = info.get('regularMarketPrice') or info.get('currentPrice')
-                previous = info.get('regularMarketPreviousClose') or info.get('previousClose')
+            previous = info.get('regularMarketPreviousClose') or info.get('previousClose')
+            
+            if current and previous:
+                current = float(current)
+                previous = float(previous)
+                change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
                 
-                if current and previous:
-                    current = float(current)
-                    previous = float(previous)
-                    change_pct = ((current - previous) / previous) * 100
-                    return {
-                        "name": name,
-                        "value": round(current, 2),
-                        "change": round(change_pct, 2)
-                    }
-            except:
-                pass
-            
-            # Fallback to historical data
-            hist = await loop.run_in_executor(None, lambda: stock.history(period="2d"))
-            
-            if hist is not None and len(hist) >= 2:
-                current = float(hist['Close'].iloc[-1])
-                previous = float(hist['Close'].iloc[-2])
-                change_pct = ((current - previous) / previous) * 100
                 return {
+                    "symbol": symbol,
                     "name": name,
                     "value": round(current, 2),
-                    "change": round(change_pct, 2)
+                    "change": round(change_pct, 2),
+                    "source": "realtime"
                 }
+        
+        # Fallback: use 1 day history (lighter than 5d)
+        hist = await loop.run_in_executor(None, lambda: stock.history(period="2d"))
+        
+        if hist is not None and len(hist) >= 2:
+            current = float(hist['Close'].iloc[-1])
+            previous = float(hist['Close'].iloc[-2])
+            change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
             
-            # Return fallback data if everything fails
-            fallback = fallback_indices.get(symbol, {'name': name, 'value': 0, 'change': 0})
             return {
-                "name": fallback['name'],
-                "value": fallback['value'],
-                "change": fallback['change']
+                "symbol": symbol,
+                "name": name,
+                "value": round(current, 2),
+                "change": round(change_pct, 2),
+                "source": "historical"
             }
-            
-        except Exception as e:
-            logger.warning(f"Error fetching {symbol}: {e}")
-            fallback = fallback_indices.get(symbol, {'name': name, 'value': 0, 'change': 0})
-            return {
-                "name": fallback['name'],
-                "value": fallback['value'],
-                "change": fallback['change']
-            }
-    
-    tasks = [fetch_index(symbol, name) for symbol, name in indices_config.items()]
-    indices_data = await asyncio.gather(*tasks)
-    
-    if use_cache:
-        # Cache for 60 seconds (shorter for indices)
-        stock_cache.set(cache_key, indices_data)
-    
-    return indices_data
+        
+        # If all fails, return None (will use cached or skip)
+        logger.warning(f"No data for {symbol}")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Error fetching {symbol}: {e}")
+        return None
 
 @app.get("/api/trending")
 async def get_trending(use_cache: bool = True):
@@ -1097,6 +1281,8 @@ async def get_trending(use_cache: bool = True):
     
     async def fetch_trending(symbol):
         try:
+            await yf_rate_limiter.acquire()
+            
             loop = asyncio.get_event_loop()
             stock = await loop.run_in_executor(None, yf.Ticker, symbol)
             info = await loop.run_in_executor(None, lambda: stock.info or {})
