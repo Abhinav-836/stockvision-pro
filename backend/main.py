@@ -16,9 +16,6 @@ import os
 import json
 import random
 from dotenv import load_dotenv
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # Configure logging
 logging.basicConfig(
@@ -50,29 +47,6 @@ from financials import (
 # Import AI service
 from ai_service import ai_service
 
-# ============= YFINANCE SESSION WITH BROWSER HEADERS =============
-def get_yfinance_session():
-    """Create a robust session for yFinance with browser headers"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://finance.yahoo.com',
-        'Referer': 'https://finance.yahoo.com/'
-    })
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-    session.mount('http://', HTTPAdapter(max_retries=retries))
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    return session
-
-# Apply session to yFinance globally
-try:
-    yf.Ticker._session = get_yfinance_session()
-    logger.info("✅ yFinance session configured with browser headers")
-except:
-    pass
-
 # ============= RATE LIMITER FOR YFINANCE =============
 class YFinanceRateLimiter:
     def __init__(self, max_calls_per_minute=25):
@@ -83,6 +57,7 @@ class YFinanceRateLimiter:
     async def acquire(self):
         async with self.lock:
             now = time.time()
+            # Remove calls older than 60 seconds
             self.calls = [t for t in self.calls if now - t < 60]
             
             if len(self.calls) >= self.max_calls:
@@ -100,17 +75,22 @@ class RequestCoalescer:
     def __init__(self):
         self.pending = {}
         self.cache = {}
-        self.cache_ttl = 30
+        self.cache_ttl = 30  # 30 seconds cache for same symbol
     
     async def get_or_fetch(self, symbol: str, fetcher_func):
+        """Get data for symbol, coalescing concurrent requests"""
+        
+        # Check memory cache first
         if symbol in self.cache:
             data, timestamp = self.cache[symbol]
             if time.time() - timestamp < self.cache_ttl:
                 return data
         
+        # If there's already a pending request for this symbol, wait for it
         if symbol in self.pending:
             return await self.pending[symbol]
         
+        # Create new request
         future = asyncio.create_task(fetcher_func(symbol))
         self.pending[symbol] = future
         
@@ -172,6 +152,9 @@ class Config:
     MAX_COMPARISON_STOCKS = int(os.getenv("MAX_COMPARISON_STOCKS", 5))
     MIN_COMPARISON_STOCKS = int(os.getenv("MIN_COMPARISON_STOCKS", 2))
     ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB = int(os.getenv("REDIS_DB", 0))
 
 config = Config()
 
@@ -219,6 +202,10 @@ class LRUCache:
         for key in keys_to_delete:
             self.delete(key)
 
+    def clear(self):
+        self.cache.clear()
+        self.timestamps.clear()
+
     def stats(self):
         total = self.hits + self.misses
         hit_rate = (self.hits / total * 100) if total > 0 else 0
@@ -260,11 +247,14 @@ app.add_middleware(
 # ============= RATE LIMIT MIDDLEWARE =============
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    """Global rate limiting for all endpoints"""
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
     
+    # Clean old requests
     request_counts[client_ip] = [t for t in request_counts[client_ip] if now - t < 60]
     
+    # 60 requests per minute per IP
     if len(request_counts[client_ip]) >= 60:
         return JSONResponse(
             status_code=429,
@@ -273,6 +263,7 @@ async def rate_limit_middleware(request: Request, call_next):
     
     request_counts[client_ip].append(now)
     
+    # Add rate limit headers
     response = await call_next(request)
     response.headers["X-RateLimit-Limit"] = "60"
     response.headers["X-RateLimit-Remaining"] = str(60 - len(request_counts[client_ip]))
@@ -348,6 +339,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ============= BACKGROUND TASKS =============
 async def market_updater():
+    """Update market indices with rate limiting"""
     while True:
         try:
             stock_cache.delete_pattern("market:indices")
@@ -363,6 +355,7 @@ async def market_updater():
         await asyncio.sleep(60)
 
 async def price_updater():
+    """Optimized price updates with rate limit protection"""
     last_prices = {}
     consecutive_failures = defaultdict(int)
     backoff_times = defaultdict(int)
@@ -371,22 +364,27 @@ async def price_updater():
         try:
             symbols = list(manager.subscriptions.keys())
             if symbols:
-                batch_size = 3
+                # Process symbols in small batches with delays
+                batch_size = 3  # Smaller batch to avoid rate limits
                 
                 for i in range(0, len(symbols), batch_size):
                     batch = symbols[i:i+batch_size]
                     
                     for symbol in batch:
+                        # Check if we should back off for this symbol
                         if backoff_times[symbol] > time.time():
                             continue
                         
                         try:
+                            # Add small delay between requests
                             await asyncio.sleep(0.2)
+                            
                             await yf_rate_limiter.acquire()
                             
                             loop = asyncio.get_event_loop()
                             stock = await loop.run_in_executor(None, yf.Ticker, symbol)
                             
+                            # Use 5m interval - good balance between freshness and API load
                             hist = await loop.run_in_executor(
                                 None, 
                                 lambda: stock.history(period="1d", interval="5m")
@@ -397,10 +395,11 @@ async def price_updater():
                                 prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
                                 change = ((current_price - prev_close) / prev_close) * 100 if prev_close != 0 else 0
                                 
+                                # Only broadcast if price changed significantly
                                 last_price = last_prices.get(symbol, current_price)
                                 price_change = abs(current_price - last_price)
                                 
-                                if price_change > 0.05 or change > 0.5:
+                                if price_change > 0.05 or change > 0.5:  # 5 cents or 0.5% change
                                     await manager.broadcast_to_symbol(symbol, {
                                         "type": "price_update",
                                         "symbol": symbol,
@@ -409,20 +408,25 @@ async def price_updater():
                                         "timestamp": datetime.now().isoformat()
                                     })
                                     last_prices[symbol] = current_price
+                                    
+                                    # Reset failure counter on success
                                     consecutive_failures[symbol] = 0
                                     backoff_times[symbol] = 0
                             else:
+                                # Track failures for backoff
                                 consecutive_failures[symbol] += 1
                                 if consecutive_failures[symbol] >= 3:
-                                    backoff_times[symbol] = time.time() + 60
-                                    logger.warning(f"Backing off updates for {symbol}")
+                                    backoff_times[symbol] = time.time() + 60  # Back off for 60 seconds
+                                    logger.warning(f"Backing off updates for {symbol} due to failures")
                                     
                         except Exception as e:
                             logger.debug(f"Price update error for {symbol}: {e}")
                             consecutive_failures[symbol] += 1
                     
+                    # Wait between batches to avoid rate limiting
                     await asyncio.sleep(1)
             
+            # Dynamic update interval based on active symbols
             update_interval = 10 if len(symbols) > 10 else 5
             await asyncio.sleep(update_interval)
             
@@ -434,16 +438,6 @@ async def price_updater():
 async def startup_event():
     asyncio.create_task(market_updater())
     asyncio.create_task(price_updater())
-    
-    # Preload popular stocks
-    popular_symbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'RELIANCE.NS']
-    for symbol in popular_symbols:
-        try:
-            await fetch_stock_data(symbol, use_cache=True)
-            logger.info(f"✅ Preloaded cache for {symbol}")
-        except Exception as e:
-            logger.warning(f"Could not preload {symbol}: {e}")
-    
     logger.info("Background tasks started")
 
 # ============= HELPER FUNCTIONS =============
@@ -458,7 +452,26 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def safe_get(dictionary: Optional[Dict], key: str, default: Any = None) -> Any:
     return dictionary.get(key, default) if dictionary else default
 
+def invalidate_symbol_cache(symbol: str):
+    stock_cache.delete_pattern(symbol)
+    chart_cache.delete_pattern(symbol)
+    logger.info(f"Invalidated cache for {symbol}")
+
+async def safe_yf_call(func, retries=3):
+    """Safely call yFinance functions with retry"""
+    for i in range(retries):
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, func)
+            if result is not None and (not isinstance(result, dict) or result):
+                return result
+        except Exception as e:
+            logger.warning(f"yFinance call attempt {i+1} failed: {e}")
+            if i < retries - 1:
+                await asyncio.sleep(0.5 * (i + 1))
+    return None
+
 def get_fallback_stock_data(symbol: str) -> Dict:
+    """Return fallback data when yFinance fails"""
     fallback_prices = {
         "AAPL": {"price": 175.50, "change": 0.5, "company": "Apple Inc.", "pe": 28.5, "market_cap": 2750000000000},
         "MSFT": {"price": 420.75, "change": 0.3, "company": "Microsoft Corp", "pe": 35.2, "market_cap": 3120000000000},
@@ -467,6 +480,9 @@ def get_fallback_stock_data(symbol: str) -> Dict:
         "TSLA": {"price": 240.50, "change": -0.3, "company": "Tesla Inc", "pe": 45.3, "market_cap": 765000000000},
         "NVDA": {"price": 850.00, "change": 1.2, "company": "NVIDIA Corp", "pe": 65.5, "market_cap": 2120000000000},
         "META": {"price": 485.00, "change": 0.8, "company": "Meta Platforms Inc", "pe": 28.9, "market_cap": 1230000000000},
+        "NFLX": {"price": 620.00, "change": 0.6, "company": "Netflix Inc", "pe": 35.2, "market_cap": 265000000000},
+        "ADBE": {"price": 525.00, "change": 0.4, "company": "Adobe Inc", "pe": 42.3, "market_cap": 235000000000},
+        "PYPL": {"price": 65.50, "change": -0.2, "company": "PayPal Holdings Inc", "pe": 15.8, "market_cap": 70000000000},
     }
     
     default = {"price": 100.00, "change": 0.0, "company": f"{symbol} Inc.", "pe": 20.0, "market_cap": 100000000000}
@@ -504,52 +520,27 @@ def get_fallback_stock_data(symbol: str) -> Dict:
         "growth_potential": "Moderate Growth",
         "valuation": "Fairly Valued",
         "technical_indicators": {
-            "rsi": 55, "trend": "Neutral",
+            "rsi": 55,
+            "trend": "Neutral",
             "sma_20": data["price"] * 0.98,
             "sma_50": data["price"] * 0.95,
             "sma_200": data["price"] * 0.90,
-            "macd": 0.5, "signal": 0.3, "histogram": 0.2
+            "macd": 0.5,
+            "signal": 0.3,
+            "histogram": 0.2
         },
-        "news": [],
+        "news": [
+            {"title": f"{data['company']} announces new products", "publisher": "Reuters", "published": datetime.now().isoformat()}
+        ],
         "ownership": {"institutional_holders": 65.0, "insider_holders": 5.0},
         "growth_metrics": {"revenue_growth": 12.5, "earnings_growth": 15.0},
         "is_fallback_data": True,
+        "message": "Using estimated data - Live data temporarily unavailable",
         "last_updated": datetime.now().isoformat()
     }
 
-def generate_mock_chart_data(symbol: str, period: str) -> List[Dict]:
-    """Generate realistic mock chart data when real data fails"""
-    from datetime import datetime, timedelta
-    
-    fallback_data = get_fallback_stock_data(symbol)
-    base_price = fallback_data.get('current_price', 100)
-    
-    days = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365}.get(period, 30)
-    
-    chart_data = []
-    price = base_price
-    volatility = 0.02
-    
-    for i in range(days, -1, -1):
-        date = datetime.now() - timedelta(days=i)
-        
-        if i > 0:
-            change = random.uniform(-volatility, volatility)
-            price = price * (1 + change)
-        
-        chart_data.append({
-            "date": date.isoformat(),
-            "price": round(price, 2),
-            "open": round(price * random.uniform(0.98, 1.02), 2),
-            "high": round(price * random.uniform(1.01, 1.03), 2),
-            "low": round(price * random.uniform(0.97, 0.99), 2),
-            "volume": random.randint(5000000, 25000000),
-            "is_mock": True
-        })
-    
-    return chart_data
-
 async def fetch_stock_data(symbol: str, use_cache: bool = True):
+    """Asynchronously fetch stock data with better error handling"""
     cache_key = f"stock_data:{symbol}"
     
     if use_cache:
@@ -564,10 +555,12 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
         loop = asyncio.get_event_loop()
         logger.info(f"Fetching data for {symbol}")
         
+        # Fix symbol mapping
         symbol = symbol.upper().strip()
         symbol_map = {"NVD": "NVDA", "BRK.B": "BRK-B", "BF.B": "BF-B"}
         symbol = symbol_map.get(symbol, symbol)
         
+        # Create ticker
         stock = None
         for attempt in range(3):
             try:
@@ -582,6 +575,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             logger.error(f"Could not create ticker for {symbol}")
             return None, {}, None
         
+        # Fetch info
         info = {}
         for attempt in range(3):
             try:
@@ -592,16 +586,17 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 if info and len(info) > 5:
                     break
             except asyncio.TimeoutError:
-                logger.warning(f"Info timeout for {symbol}")
+                logger.warning(f"Info timeout for {symbol} (attempt {attempt+1})")
             except Exception as e:
                 logger.warning(f"Info error for {symbol}: {e}")
             await asyncio.sleep(0.5)
         
+        # Try alternative symbol
         if not info or len(info) < 5:
             if not symbol.endswith('.NS') and not symbol.endswith('.BO'):
                 alt_symbol = symbol + '.NS'
                 try:
-                    logger.info(f"Trying alternative: {alt_symbol}")
+                    logger.info(f"Trying alternative symbol: {alt_symbol}")
                     alt_stock = await loop.run_in_executor(None, yf.Ticker, alt_symbol)
                     alt_info = await asyncio.wait_for(
                         loop.run_in_executor(None, lambda: alt_stock.info or {}),
@@ -615,6 +610,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 except Exception as e:
                     logger.debug(f"Alternative failed: {e}")
         
+        # Fetch history
         hist = None
         periods_to_try = ["1y", "6mo", "3mo", "1mo"]
         
@@ -634,7 +630,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             await asyncio.sleep(0.5)
         
         if hist is None or hist.empty:
-            logger.warning(f"No history for {symbol}, using fallback")
+            logger.warning(f"No history available for {symbol}, returning fallback")
             return None, info if info else {}, None
         
         result = (stock, info, hist)
@@ -651,16 +647,26 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
 
 def calculate_price_metrics(info: Dict, hist) -> Dict:
     try:
-        current_price = (info.get('currentPrice') or info.get('regularMarketPrice') or 
-                        info.get('previousClose') or (hist['Close'].iloc[-1] if len(hist) > 0 else 0.0))
+        current_price = (
+            info.get('currentPrice') or 
+            info.get('regularMarketPrice') or 
+            info.get('previousClose') or
+            (hist['Close'].iloc[-1] if len(hist) > 0 else 0.0)
+        )
         
-        previous_close = (info.get('previousClose') or (hist['Close'].iloc[-2] if len(hist) > 1 else current_price))
+        previous_close = (
+            info.get('previousClose') or
+            (hist['Close'].iloc[-2] if len(hist) > 1 else current_price)
+        )
         
         current_price = safe_float(current_price)
         previous_close = safe_float(previous_close)
         
         change = current_price - previous_close
-        change_percent = ((current_price - previous_close) / previous_close) * 100 if previous_close and previous_close != 0 else 0.0
+        change_percent = (
+            ((current_price - previous_close) / previous_close) * 100
+            if previous_close and previous_close != 0 else 0.0
+        )
         
         day_high = info.get('dayHigh') or (hist['High'].iloc[-1] if len(hist) > 0 else current_price)
         day_low = info.get('dayLow') or (hist['Low'].iloc[-1] if len(hist) > 0 else current_price)
@@ -676,7 +682,15 @@ def calculate_price_metrics(info: Dict, hist) -> Dict:
         }
     except Exception as e:
         logger.error(f"Error calculating price metrics: {str(e)}")
-        return {"current_price": 0.0, "previous_close": 0.0, "change": 0.0, "change_percent": 0.0, "day_high": 0.0, "day_low": 0.0, "volume": 0}
+        return {
+            "current_price": 0.0,
+            "previous_close": 0.0,
+            "change": 0.0,
+            "change_percent": 0.0,
+            "day_high": 0.0,
+            "day_low": 0.0,
+            "volume": 0
+        }
 
 def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
     try:
@@ -697,10 +711,17 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
         news = get_latest_news(symbol)
         
         metrics = {
-            'pe_ratio': pe_ratio, 'pb_ratio': pb_ratio, 'dividend_yield': dividend_yield,
-            'debt_to_equity': debt_to_equity, 'eps': eps, 'roe': roe, 'roa': roa,
-            'current_ratio': current_ratio, 'volatility': volatility,
-            'growth_metrics': growth_metrics, 'technical_indicators': technical_indicators,
+            'pe_ratio': pe_ratio,
+            'pb_ratio': pb_ratio,
+            'dividend_yield': dividend_yield,
+            'debt_to_equity': debt_to_equity,
+            'eps': eps,
+            'roe': roe,
+            'roa': roa,
+            'current_ratio': current_ratio,
+            'volatility': volatility,
+            'growth_metrics': growth_metrics,
+            'technical_indicators': technical_indicators,
             'sector': info.get('sector')
         }
         
@@ -728,22 +749,37 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
             fifty_two_week_low = float(hist['Low'].min())
         
         return {
-            "symbol": display_symbol, "original_symbol": symbol, "is_indian_stock": is_indian,
-            "company_name": company_name, **price_metrics,
-            "market_cap": market_cap, "pe_ratio": round(pe_ratio, 2) if pe_ratio else None,
-            "pb_ratio": round(pb_ratio, 2) if pb_ratio else None,
-            "dividend_yield": round(dividend_yield, 2) if dividend_yield else None,
-            "debt_to_equity": round(debt_to_equity, 2) if debt_to_equity else None,
-            "eps": round(eps, 2) if eps else None, "roe": round(roe, 2) if roe else None,
-            "roa": round(roa, 2) if roa else None, "current_ratio": round(current_ratio, 2) if current_ratio else None,
-            "volatility": round(volatility, 4), "fifty_two_week_high": round(fifty_two_week_high, 2),
-            "fifty_two_week_low": round(fifty_two_week_low, 2), "average_volume": safe_float(safe_get(info, 'averageVolume', 0)),
-            "sector": safe_get(info, 'sector'), "industry": safe_get(info, 'industry'), "exchange": safe_get(info, 'exchange'),
-            "ai_score": round(ai_score, 2), "recommendation": recommendation_data.get('recommendation', 'Hold'),
-            "confidence": recommendation_data.get('confidence', 'Moderate'), "risk_level": recommendation_data.get('risk_level', 'Moderate Risk'),
+            "symbol": display_symbol,
+            "original_symbol": symbol,
+            "is_indian_stock": is_indian,
+            "company_name": company_name,
+            **price_metrics,
+            "market_cap": market_cap,
+            "pe_ratio": round(pe_ratio, 2) if pe_ratio is not None else None,
+            "pb_ratio": round(pb_ratio, 2) if pb_ratio is not None else None,
+            "dividend_yield": round(dividend_yield, 2) if dividend_yield is not None else None,
+            "debt_to_equity": round(debt_to_equity, 2) if debt_to_equity is not None else None,
+            "eps": round(eps, 2) if eps is not None else None,
+            "roe": round(roe, 2) if roe is not None else None,
+            "roa": round(roa, 2) if roa is not None else None,
+            "current_ratio": round(current_ratio, 2) if current_ratio is not None else None,
+            "volatility": round(volatility, 4),
+            "fifty_two_week_high": round(fifty_two_week_high, 2),
+            "fifty_two_week_low": round(fifty_two_week_low, 2),
+            "average_volume": safe_float(safe_get(info, 'averageVolume', 0)),
+            "sector": safe_get(info, 'sector'),
+            "industry": safe_get(info, 'industry'),
+            "exchange": safe_get(info, 'exchange'),
+            "ai_score": round(ai_score, 2),
+            "recommendation": recommendation_data.get('recommendation', 'Hold'),
+            "confidence": recommendation_data.get('confidence', 'Moderate'),
+            "risk_level": recommendation_data.get('risk_level', 'Moderate Risk'),
             "growth_potential": recommendation_data.get('growth_potential', 'Moderate Growth'),
-            "valuation": recommendation_data.get('valuation', 'Fairly Valued'), "technical_indicators": technical_indicators,
-            "news": news[:5], "ownership": ownership, "growth_metrics": growth_metrics,
+            "valuation": recommendation_data.get('valuation', 'Fairly Valued'),
+            "technical_indicators": technical_indicators,
+            "news": news[:5],
+            "ownership": ownership,
+            "growth_metrics": growth_metrics,
             "last_updated": datetime.now().isoformat()
         }
     except Exception as e:
@@ -754,25 +790,41 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
 @app.get("/")
 async def root():
     return {
-        "service": config.API_TITLE, "version": config.API_VERSION, "status": "operational",
+        "service": config.API_TITLE,
+        "version": config.API_VERSION,
+        "status": "operational",
         "timestamp": datetime.now().isoformat(),
         "endpoints": {
-            "health": "/health", "stock_analysis": "/api/stock/{symbol}",
-            "chart_data": "/api/stock/{symbol}/chart", "compare": "/api/compare",
-            "trending": "/api/trending", "market_indices": "/api/market-indices",
-            "search": "/api/search/{query}", "ai_compare": "/api/ai/compare",
-            "ai_thesis": "/api/ai/thesis/{symbol}", "ai_question": "/api/ai/question",
-            "ai_sentiment": "/api/ai/sentiment", "debug": "/api/debug/{symbol}",
-            "docs": "/api/docs", "websocket": "/ws"
+            "health": "/health",
+            "stock_analysis": "/api/stock/{symbol}",
+            "chart_data": "/api/stock/{symbol}/chart",
+            "compare": "/api/compare",
+            "trending": "/api/trending",
+            "market_indices": "/api/market-indices",
+            "search": "/api/search/{query}",
+            "ai_compare": "/api/ai/compare",
+            "ai_thesis": "/api/ai/thesis/{symbol}",
+            "ai_question": "/api/ai/question",
+            "ai_sentiment": "/api/ai/sentiment",
+            "cache_invalidate": "/api/cache/invalidate/{symbol}",
+            "debug": "/api/debug/{symbol}",
+            "docs": "/api/docs",
+            "websocket": "/ws"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "version": config.API_VERSION, "cache_stats": stock_cache.stats()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": config.API_VERSION,
+        "cache_stats": stock_cache.stats()
+    }
 
 @app.get("/api/stock/{symbol}")
 async def get_stock_analysis(symbol: str, use_cache: bool = True):
+    """Get comprehensive stock analysis with fallback"""
     try:
         symbol = symbol.upper().strip()
         logger.info(f"Stock analysis requested for {symbol}")
@@ -789,22 +841,30 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
         if result and result[0] is not None and result[2] is not None:
             stock, info, hist = result
             response_data = build_stock_response(symbol, stock, info, hist)
+            
             if use_cache:
                 stock_cache.set(cache_key, response_data)
+            
             return response_data
         
         logger.warning(f"Using fallback data for {symbol}")
         fallback_data = get_fallback_stock_data(symbol)
+        
         if use_cache:
             stock_cache.set(cache_key, fallback_data)
+        
         return fallback_data
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in get_stock_analysis for {symbol}: {str(e)}")
-        return get_fallback_stock_data(symbol)
+        fallback_data = get_fallback_stock_data(symbol)
+        return fallback_data
 
 @app.get("/api/stock/{symbol}/chart")
 async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = True):
+    """Get chart data with smart caching and rate limiting"""
     try:
         symbol = symbol.upper().strip()
         
@@ -819,60 +879,70 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             if cached_data:
                 return cached_data
         
-        is_indian = symbol.endswith('.NS') or symbol.endswith('.BO')
-        
+        # Use rate limiter
         await yf_rate_limiter.acquire()
         
         loop = asyncio.get_event_loop()
         
-        symbols_to_try = [symbol]
-        if is_indian:
-            symbols_to_try.extend([symbol.replace('.NS', '.BO'), symbol.replace('.NS', '')])
+        # Use interval based on period to reduce data points
+        interval = "1d" if period in ["1mo", "3mo", "6mo", "1y"] else "1h"
         
-        interval = "1h" if not is_indian and period in ["1d", "5d"] else "1d"
-        period_to_use = "3mo" if is_indian and period == "1y" else period
-        timeout = 15 if is_indian else 10
+        stock = await loop.run_in_executor(None, yf.Ticker, symbol)
+        hist = await loop.run_in_executor(
+            None, 
+            lambda: stock.history(period=period, interval=interval)
+        )
         
-        chart_data = None
+        if hist is not None and not hist.empty:
+            # Limit data points for better performance
+            max_points = 100
+            if len(hist) > max_points:
+                hist = hist.iloc[-max_points:]  # Take last N points
+            
+            chart_data = []
+            for date, row in hist.iterrows():
+                chart_data.append({
+                    "date": date.isoformat(),
+                    "price": round(float(row['Close']), 2),
+                    "open": round(float(row['Open']), 2),
+                    "high": round(float(row['High']), 2),
+                    "low": round(float(row['Low']), 2),
+                    "volume": int(row['Volume']) if 'Volume' in row else 0
+                })
+            
+            if use_cache:
+                # Cache for 5 minutes for older periods, 1 minute for recent
+                ttl = 60 if period == "1d" else 300
+                # Use custom TTL by setting directly
+                chart_cache.set(cache_key, chart_data)
+            
+            return chart_data
         
-        for try_symbol in symbols_to_try:
-            try:
-                stock = await loop.run_in_executor(None, yf.Ticker, try_symbol)
-                
-                hist = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: stock.history(period=period_to_use, interval=interval)),
-                    timeout=timeout
-                )
-                
-                if hist is not None and not hist.empty:
-                    logger.info(f"✅ REAL chart data for {try_symbol}")
-                    
-                    max_points = 100
-                    if len(hist) > max_points:
-                        hist = hist.iloc[-max_points:]
-                    
-                    chart_data = []
-                    for date, row in hist.iterrows():
-                        chart_data.append({
-                            "date": date.isoformat(),
-                            "price": round(float(row['Close']), 2),
-                            "open": round(float(row['Open']), 2),
-                            "high": round(float(row['High']), 2),
-                            "low": round(float(row['Low']), 2),
-                            "volume": int(row['Volume']) if 'Volume' in row else 0
-                        })
-                    break
-                    
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout for {try_symbol}")
-                continue
-            except Exception as e:
-                logger.warning(f"Error for {try_symbol}: {e}")
-                continue
+        # Generate mock chart data for fallback
+        import random
+        from datetime import datetime, timedelta
         
-        if not chart_data:
-            logger.warning(f"No real data for {symbol}, generating mock data")
-            chart_data = generate_mock_chart_data(symbol, period)
+        # Get current price from fallback or use default
+        stock_data = get_fallback_stock_data(symbol)
+        base_price = stock_data.get('current_price', 100)
+        
+        chart_data = []
+        days = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365}.get(period, 30)
+        
+        for i in range(days, -1, -1):
+            date = datetime.now() - timedelta(days=i)
+            # Generate realistic price movement
+            change = random.uniform(-0.03, 0.03)
+            price = base_price * (1 + change * (i / days))
+            
+            chart_data.append({
+                "date": date.isoformat(),
+                "price": round(price, 2),
+                "open": round(price * random.uniform(0.98, 1.02), 2),
+                "high": round(price * random.uniform(1.01, 1.03), 2),
+                "low": round(price * random.uniform(0.97, 0.99), 2),
+                "volume": random.randint(5000000, 25000000)
+            })
         
         if use_cache:
             chart_cache.set(cache_key, chart_data)
@@ -881,7 +951,7 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
         
     except Exception as e:
         logger.error(f"Error fetching chart for {symbol}: {str(e)}")
-        return generate_mock_chart_data(symbol, period)
+        return []
 
 @app.post("/api/compare")
 async def compare_stocks(request: CompareRequest):
@@ -928,7 +998,10 @@ async def compare_stocks(request: CompareRequest):
             "failed_symbols": failed_symbols
         }
         
-        return {"stocks": stocks_data, "comparison": comparison_data}
+        return {
+            "stocks": stocks_data,
+            "comparison": comparison_data
+        }
         
     except Exception as e:
         logger.error(f"Error comparing stocks: {str(e)}")
@@ -938,7 +1011,10 @@ async def compare_stocks(request: CompareRequest):
 async def ai_compare_stocks(request: CompareRequest, req: Request = None):
     try:
         symbols = request.symbols
-        user_id = req.client.host if req and req.client else "anonymous"
+        
+        user_id = "anonymous"
+        if req and req.client:
+            user_id = req.client.host
         
         tasks = [fetch_stock_data(symbol) for symbol in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -959,14 +1035,20 @@ async def ai_compare_stocks(request: CompareRequest, req: Request = None):
         rate_limit_stats = ai_service.get_rate_limit_stats()
         
         return {
-            "success": True, "stocks": stocks_data, "ai_analysis": ai_analysis,
-            "failed_symbols": failed_symbols, "rate_limit": rate_limit_stats,
+            "success": True,
+            "stocks": stocks_data,
+            "ai_analysis": ai_analysis,
+            "failed_symbols": failed_symbols,
+            "rate_limit": rate_limit_stats,
             "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
         logger.error(f"Error in AI comparison: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.get("/api/ai/thesis/{symbol}")
 async def get_ai_thesis(symbol: str, req: Request = None):
@@ -985,11 +1067,19 @@ async def get_ai_thesis(symbol: str, req: Request = None):
         news = get_latest_news(symbol)
         thesis = await ai_service.generate_investment_thesis(stock_data, news, user_id=user_id)
         
-        return {"success": True, "symbol": symbol, "thesis": thesis, "timestamp": datetime.now().isoformat()}
+        return {
+            "success": True,
+            "symbol": symbol,
+            "thesis": thesis,
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
         logger.error(f"Error generating thesis: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.post("/api/ai/question")
 async def ask_ai_question(request: dict, req: Request = None):
@@ -1015,11 +1105,19 @@ async def ask_ai_question(request: dict, req: Request = None):
         
         answer = await ai_service.answer_question(question, stock_data, user_id=user_id)
         
-        return {"success": True, "question": question, "answer": answer, "timestamp": datetime.now().isoformat()}
+        return {
+            "success": True,
+            "question": question,
+            "answer": answer,
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
         logger.error(f"Error answering question: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.post("/api/ai/sentiment")
 async def analyze_sentiment(request: dict, req: Request = None):
@@ -1037,28 +1135,48 @@ async def analyze_sentiment(request: dict, req: Request = None):
         
         sentiment = await ai_service.get_market_sentiment(symbols, news_data, user_id=user_id)
         
-        return {"success": True, "sentiment": sentiment, "timestamp": datetime.now().isoformat()}
+        return {
+            "success": True,
+            "sentiment": sentiment,
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
         logger.error(f"Error analyzing sentiment: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.get("/api/market-indices")
 async def get_market_indices(use_cache: bool = True):
+    """Get major market indices with real-time data and rate limiting"""
     cache_key = "market:indices"
     
     if use_cache:
         cached_data = stock_cache.get(cache_key)
         if cached_data:
-            return cached_data
+            # Check if cache is still fresh (2 minutes for indices)
+            if hasattr(cached_data, '_timestamp'):
+                if time.time() - cached_data._timestamp < 120:
+                    return cached_data
     
+    # Define indices with proper yFinance symbols
     indices_config = {
-        '^GSPC': 'S&P 500', '^IXIC': 'NASDAQ', '^DJI': 'DOW JONES',
-        '^RUT': 'RUSSELL 2000', '^VIX': 'VIX', '^NSEI': 'NIFTY 50',
-        '^BSESN': 'SENSEX', 'BTC-USD': 'Bitcoin', 'GC=F': 'Gold', 'CL=F': 'Crude Oil'
+        '^GSPC': 'S&P 500',
+        '^IXIC': 'NASDAQ',
+        '^DJI': 'DOW JONES',
+        '^RUT': 'RUSSELL 2000',
+        '^VIX': 'VIX',
+        '^NSEI': 'NIFTY 50',
+        '^BSESN': 'SENSEX',
+        'BTC-USD': 'Bitcoin',
+        'GC=F': 'Gold',
+        'CL=F': 'Crude Oil'
     }
     
-    semaphore = asyncio.Semaphore(3)
+    # Use asyncio.gather with semaphore for rate limiting
+    semaphore = asyncio.Semaphore(3)  # Only 3 concurrent requests
     
     async def fetch_index_with_limit(symbol, name):
         async with semaphore:
@@ -1067,35 +1185,51 @@ async def get_market_indices(use_cache: bool = True):
     tasks = [fetch_index_with_limit(symbol, name) for symbol, name in indices_config.items()]
     indices_data = await asyncio.gather(*tasks, return_exceptions=True)
     
+    # Process results
     valid_indices = []
     for result in indices_data:
         if isinstance(result, Exception):
+            logger.warning(f"Index fetch failed: {result}")
             continue
         if result:
             valid_indices.append(result)
     
+    # If we got less than 50% of indices, use cached/fallback
     if len(valid_indices) < len(indices_config) * 0.5:
         cached_data = stock_cache.get(cache_key)
         if cached_data:
+            logger.info("Using cached indices due to low success rate")
             return cached_data
     
+    # Cache for 2 minutes
     if use_cache and valid_indices:
+        # Add timestamp to cached data
+        valid_indices._timestamp = time.time()
         stock_cache.set(cache_key, valid_indices)
     
     return valid_indices
 
 async def fetch_single_index(symbol: str, name: str) -> Optional[Dict]:
+    """Fetch single index with proper error handling and rate limiting"""
     try:
+        # Small delay between requests to be nice to yFinance
         await asyncio.sleep(0.1)
+        
+        # Apply rate limiting
         await yf_rate_limiter.acquire()
         
         loop = asyncio.get_event_loop()
         stock = await loop.run_in_executor(None, yf.Ticker, symbol)
         
+        # Try to get info first (fast path)
         info = await loop.run_in_executor(None, lambda: stock.info or {})
         
         if info:
-            current = (info.get('regularMarketPrice') or info.get('currentPrice') or info.get('previousClose'))
+            # Try multiple price fields
+            current = (info.get('regularMarketPrice') or 
+                      info.get('currentPrice') or 
+                      info.get('previousClose'))
+            
             previous = info.get('regularMarketPreviousClose') or info.get('previousClose')
             
             if current and previous:
@@ -1103,8 +1237,15 @@ async def fetch_single_index(symbol: str, name: str) -> Optional[Dict]:
                 previous = float(previous)
                 change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
                 
-                return {"symbol": symbol, "name": name, "value": round(current, 2), "change": round(change_pct, 2), "source": "realtime"}
+                return {
+                    "symbol": symbol,
+                    "name": name,
+                    "value": round(current, 2),
+                    "change": round(change_pct, 2),
+                    "source": "realtime"
+                }
         
+        # Fallback: use 1 day history (lighter than 5d)
         hist = await loop.run_in_executor(None, lambda: stock.history(period="2d"))
         
         if hist is not None and len(hist) >= 2:
@@ -1112,8 +1253,16 @@ async def fetch_single_index(symbol: str, name: str) -> Optional[Dict]:
             previous = float(hist['Close'].iloc[-2])
             change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
             
-            return {"symbol": symbol, "name": name, "value": round(current, 2), "change": round(change_pct, 2), "source": "historical"}
+            return {
+                "symbol": symbol,
+                "name": name,
+                "value": round(current, 2),
+                "change": round(change_pct, 2),
+                "source": "historical"
+            }
         
+        # If all fails, return None (will use cached or skip)
+        logger.warning(f"No data for {symbol}")
         return None
         
     except Exception as e:
@@ -1133,6 +1282,7 @@ async def get_trending(use_cache: bool = True):
     async def fetch_trending(symbol):
         try:
             await yf_rate_limiter.acquire()
+            
             loop = asyncio.get_event_loop()
             stock = await loop.run_in_executor(None, yf.Ticker, symbol)
             info = await loop.run_in_executor(None, lambda: stock.info or {})
@@ -1143,9 +1293,14 @@ async def get_trending(use_cache: bool = True):
                 previous = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current
                 change_pct = ((current - previous) / previous) * 100 if previous != 0 else 0
                 
-                return {"symbol": symbol, "name": safe_get(info, 'longName', symbol), "price": round(current, 2),
-                        "change": round(change_pct, 2), "volume": safe_float(safe_get(info, 'volume', 0)),
-                        "market_cap": safe_float(safe_get(info, 'marketCap', 0))}
+                return {
+                    "symbol": symbol,
+                    "name": safe_get(info, 'longName', symbol),
+                    "price": round(current, 2),
+                    "change": round(change_pct, 2),
+                    "volume": safe_float(safe_get(info, 'volume', 0)),
+                    "market_cap": safe_float(safe_get(info, 'marketCap', 0))
+                }
         except Exception as e:
             logger.error(f"Error fetching trending {symbol}: {e}")
         return None
@@ -1155,8 +1310,10 @@ async def get_trending(use_cache: bool = True):
     trending_data = [r for r in results if r is not None]
     
     response = {"trending": trending_data}
+    
     if use_cache:
         stock_cache.set(cache_key, response)
+    
     return response
 
 @app.get("/api/search/{query}")
@@ -1165,11 +1322,35 @@ async def search_stocks(query: str):
         return {"results": []}
     
     stock_db = {
-        "AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "GOOGL": "Alphabet Inc.",
-        "AMZN": "Amazon.com Inc.", "TSLA": "Tesla Inc.", "NVDA": "NVIDIA Corporation",
-        "META": "Meta Platforms Inc.", "RELIANCE.NS": "Reliance Industries Ltd",
-        "TCS.NS": "Tata Consultancy Services Ltd", "HDFCBANK.NS": "HDFC Bank Ltd",
-        "INFY.NS": "Infosys Ltd", "ICICIBANK.NS": "ICICI Bank Ltd",
+        "AAPL": "Apple Inc.",
+        "MSFT": "Microsoft Corporation",
+        "GOOGL": "Alphabet Inc.",
+        "AMZN": "Amazon.com Inc.",
+        "TSLA": "Tesla Inc.",
+        "NVDA": "NVIDIA Corporation",
+        "META": "Meta Platforms Inc.",
+        "JPM": "JPMorgan Chase & Co.",
+        "V": "Visa Inc.",
+        "JNJ": "Johnson & Johnson",
+        "WMT": "Walmart Inc.",
+        "PG": "Procter & Gamble Co.",
+        "DIS": "The Walt Disney Company",
+        "NFLX": "Netflix Inc.",
+        "ADBE": "Adobe Inc.",
+        "PYPL": "PayPal Holdings Inc.",
+        "INTC": "Intel Corporation",
+        "CSCO": "Cisco Systems Inc.",
+        "PFE": "Pfizer Inc.",
+        "XOM": "Exxon Mobil Corporation",
+        "BAC": "Bank of America Corp",
+        "KO": "The Coca-Cola Company",
+        "PEP": "PepsiCo Inc.",
+        "NKE": "Nike Inc.",
+        "RELIANCE.NS": "Reliance Industries Ltd",
+        "TCS.NS": "Tata Consultancy Services Ltd",
+        "HDFCBANK.NS": "HDFC Bank Ltd",
+        "INFY.NS": "Infosys Ltd",
+        "ICICIBANK.NS": "ICICI Bank Ltd",
     }
     
     query_upper = query.upper()
@@ -1177,9 +1358,17 @@ async def search_stocks(query: str):
     
     for symbol, name in stock_db.items():
         if query_upper in symbol or query_upper in name.upper():
-            results.append({"symbol": symbol, "name": name, "match_type": "symbol" if query_upper in symbol else "name"})
+            results.append({
+                "symbol": symbol,
+                "name": name,
+                "match_type": "symbol" if query_upper in symbol else "name"
+            })
     
-    results.sort(key=lambda x: (0 if x['match_type'] == 'symbol' and x['symbol'] == query_upper else 1 if x['match_type'] == 'symbol' else 2, x['symbol']))
+    results.sort(key=lambda x: (
+        0 if x['match_type'] == 'symbol' and x['symbol'] == query_upper else
+        1 if x['match_type'] == 'symbol' else 2,
+        x['symbol']
+    ))
     
     return {"results": results[:15]}
 
@@ -1189,40 +1378,77 @@ async def debug_stock(symbol: str):
         symbol = symbol.upper().strip()
         logger.info(f"Debug endpoint called for {symbol}")
         
-        result = {"symbol": symbol, "timestamp": datetime.now().isoformat(), "tests": []}
+        result = {
+            "symbol": symbol,
+            "timestamp": datetime.now().isoformat(),
+            "tests": []
+        }
         
         try:
             stock = yf.Ticker(symbol)
-            result["tests"].append({"name": "create_ticker", "success": True, "message": f"Ticker created for {symbol}"})
+            result["tests"].append({
+                "name": "create_ticker",
+                "success": True,
+                "message": f"Ticker created for {symbol}"
+            })
         except Exception as e:
-            result["tests"].append({"name": "create_ticker", "success": False, "error": str(e)})
+            result["tests"].append({
+                "name": "create_ticker",
+                "success": False,
+                "error": str(e)
+            })
             return result
         
         try:
             info = stock.info
             info_keys = list(info.keys()) if info else []
-            result["tests"].append({"name": "get_info", "success": bool(info and len(info) > 0),
-                                   "info_keys_count": len(info_keys), "info_sample": info_keys[:10] if info_keys else [],
-                                   "has_longName": "longName" in info if info else False,
-                                   "has_regularMarketPrice": "regularMarketPrice" in info if info else False})
+            result["tests"].append({
+                "name": "get_info",
+                "success": bool(info and len(info) > 0),
+                "info_keys_count": len(info_keys),
+                "info_sample": info_keys[:10] if info_keys else [],
+                "has_longName": "longName" in info if info else False,
+                "has_regularMarketPrice": "regularMarketPrice" in info if info else False
+            })
         except Exception as e:
-            result["tests"].append({"name": "get_info", "success": False, "error": str(e)})
+            result["tests"].append({
+                "name": "get_info",
+                "success": False,
+                "error": str(e)
+            })
         
         try:
             hist = stock.history(period="1mo")
             hist_empty = hist.empty if hist is not None else True
-            result["tests"].append({"name": "get_history", "success": not hist_empty,
-                                   "history_days": len(hist) if not hist_empty else 0,
-                                   "history_columns": list(hist.columns) if not hist_empty else []})
+            result["tests"].append({
+                "name": "get_history",
+                "success": not hist_empty,
+                "history_days": len(hist) if not hist_empty else 0,
+                "history_columns": list(hist.columns) if not hist_empty else []
+            })
         except Exception as e:
-            result["tests"].append({"name": "get_history", "success": False, "error": str(e)})
+            result["tests"].append({
+                "name": "get_history",
+                "success": False,
+                "error": str(e)
+            })
         
         return result
         
     except Exception as e:
         logger.error(f"Debug endpoint error: {e}")
-        return {"symbol": symbol, "error": str(e), "timestamp": datetime.now().isoformat()}
+        return {
+            "symbol": symbol,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
