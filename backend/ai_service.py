@@ -179,7 +179,7 @@ class OpenRouterAIService:
                             presence_penalty=0
                         )
                     ),
-                    timeout=15.0
+                    timeout=25.0
                 )
 
                 response = completion.choices[0].message.content
