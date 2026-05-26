@@ -160,7 +160,7 @@ class OpenRouterAIService:
             cache_key = f"{prompt[:100]}_{system_prompt[:100] if system_prompt else ''}"
             if cache_key in self.cache:
                 cache_time, cache_response = self.cache[cache_key]
-                if (datetime.now() - cache_time).seconds < self.cache_ttl:
+                if (datetime.now() - cache_time).total_seconds() < self.cache_ttl:
                     logger.debug("✅ AI response cache hit")
                     return cache_response
 

@@ -279,8 +279,8 @@ class StockRequest(BaseModel):
         v = v.upper().strip()
         if not v:
             raise ValueError('Symbol cannot be empty')
-        if not re.match(r'^[A-Z]{1,5}(\.[A-Z]{2})?$', v):
-            raise ValueError('Invalid symbol format. Use 1-5 uppercase letters, optionally with .NS or .BO suffix.')
+        if not re.match(r'^[A-Z0-9]{1,10}(\.[A-Z]{2,3})?$', v):
+            raise ValueError('Invalid symbol format. Use 1-10 uppercase letters/digits, optionally with .NS, .BO, or similar suffix.')
         return v
 
 class CompareRequest(BaseModel):
@@ -296,7 +296,7 @@ class CompareRequest(BaseModel):
         cleaned = []
         for symbol in v:
             symbol = symbol.upper().strip()
-            if not re.match(r'^[A-Z]{1,5}(\.[A-Z]{2})?$', symbol):
+            if not re.match(r'^[A-Z0-9]{1,10}(\.[A-Z]{2,3})?$', symbol):
                 raise ValueError(f'Invalid symbol: {symbol}')
             cleaned.append(symbol)
         
@@ -501,7 +501,7 @@ def get_fallback_stock_data(symbol: str) -> Dict:
         "pb_ratio": 4.5,
         "dividend_yield": 0.5,
         "market_cap": data["market_cap"],
-        "eps": data["pe"] and data["price"] / data["pe"] if data["pe"] else 5.0,
+        "eps": round(data["price"] / data["pe"], 2) if data["pe"] else 5.0,
         "roe": 25.0,
         "roa": 12.0,
         "current_ratio": 1.5,
@@ -1156,10 +1156,9 @@ async def get_market_indices(use_cache: bool = True):
     if use_cache:
         cached_data = stock_cache.get(cache_key)
         if cached_data:
-            # Check if cache is still fresh (2 minutes for indices)
-            if hasattr(cached_data, '_timestamp'):
-                if time.time() - cached_data._timestamp < 120:
-                    return cached_data
+            cached_ts = cached_data.get("_timestamp", 0) if isinstance(cached_data, dict) else 0
+            if time.time() - cached_ts < 120:
+                return cached_data.get("indices", cached_data) if isinstance(cached_data, dict) else cached_data
     
     # Define indices with proper yFinance symbols
     indices_config = {
@@ -1203,10 +1202,8 @@ async def get_market_indices(use_cache: bool = True):
     
     # Cache for 2 minutes
     if use_cache and valid_indices:
-        # Add timestamp to cached data
-        valid_indices._timestamp = time.time()
-        stock_cache.set(cache_key, valid_indices)
-    
+        stock_cache.set(cache_key, {"indices": valid_indices, "_timestamp": time.time()})
+
     return valid_indices
 
 async def fetch_single_index(symbol: str, name: str) -> Optional[Dict]:

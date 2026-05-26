@@ -31,20 +31,15 @@ def normalize_percentage(value: Optional[float]) -> Optional[float]:
     if 0 <= value <= 1:
         return round(value * 100, 2)
     
-    # Case 2: Normal percentage (1% to 100%)
-    # Example: 15.7 → 15.7%
-    if 1 < value <= 100:
-        return round(value, 2)
-    
-    # Case 3: Large value that should be divided (100%+)
-    # Example: 1.52 (ROE as ratio) → 152%
-    # But wait - yFinance sometimes gives 152 directly
-    # So we need to detect: if value is between 1-10 AND looks like ratio
+    # Case 2: Small value between 1-10 could be a ratio (1.52 = 152% for ROE)
+    # Must be checked BEFORE the general percentage range
     if 1 < value <= 10:
-        # Could be ratio (1.52 = 152%) OR small percentage (1.5%)
-        # Check context from other metrics to decide
-        # For now, assume ratio for ROE/ROA, percentage for others
         return round(value * 100, 2)
+
+    # Case 3: Normal percentage (10% to 100%)
+    # Example: 15.7 → 15.7%
+    if 10 < value <= 100:
+        return round(value, 2)
     
     # Case 4: Already large percentage (over 100%)
     if 100 < value <= 1000:
