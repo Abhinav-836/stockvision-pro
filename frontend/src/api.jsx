@@ -1,7 +1,10 @@
 // frontend/src/api.jsx
 
 // FIXED: Remove trailing slash from base URL
-const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+// Exported so other modules (e.g. useRealtimePrice) use the same source
+// of truth instead of re-reading import.meta.env.VITE_API_URL themselves,
+// which previously caused inconsistent fallback behavior between files.
+export const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
 
 const CACHE_DURATION = 60 * 1000; // 1 minute
 const cache = new Map();

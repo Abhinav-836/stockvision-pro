@@ -41,17 +41,24 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     setStockData(null);
     setChartData([]);
 
+    // OPTIMIZED: analysis and chart data are independent requests, so
+    // fetch them in parallel instead of awaiting the analysis first —
+    // the chart used to sit idle for the whole analysis round-trip
+    // before it even started loading.
+    const chartPromise = fetchChartData(cleanSymbol, chartPeriod);
+
     try {
       const data = await getStockAnalysis(cleanSymbol);
       console.log('📊 API Response:', data);
       setStockData(data);
-      await fetchChartData(cleanSymbol, chartPeriod);
     } catch (err) {
       console.error('❌ API Error:', err);
       setError(err.message || 'Failed to fetch stock data');
     } finally {
       setLoading(false);
     }
+
+    await chartPromise;
   };
 
   const fetchChartData = async (symbolToFetch, period) => {
@@ -189,6 +196,20 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
             <div className="connection-warning">
               <i className="fas fa-plug"></i>
               <span>Using cached data - WebSocket disconnected</span>
+            </div>
+          )}
+
+          {displayData.is_stale && (
+            <div className="connection-warning">
+              <i className="fas fa-clock"></i>
+              <span>Live data temporarily unavailable — showing last known real price</span>
+            </div>
+          )}
+
+          {displayData.is_fallback_data && (
+            <div className="connection-warning">
+              <i className="fas fa-exclamation-triangle"></i>
+              <span>{displayData.message || 'Using estimated data — live data temporarily unavailable'}</span>
             </div>
           )}
 

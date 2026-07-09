@@ -1,6 +1,6 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.0
-yfinance==0.2.54
+yfinance==0.2.66
 pandas==2.2.3
 numpy==2.2.4
 python-multipart==0.0.20
@@ -12,3 +12,4 @@ openai==1.70.0
 redis==5.2.1
 cachetools==5.5.2
 typing-extensions==4.13.2
+finnhub-python==2.4.18
