@@ -1,4 +1,4 @@
-# backend/main.py — FIXED: yFinance fills missing fundamentals only
+# backend/main.py — OPTIMIZED HYBRID ENGINE (Finnhub → Alpha Vantage → yFinance)
 
 from fastapi import FastAPI, HTTPException, Request, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,12 +12,12 @@ import asyncio
 import logging
 from collections import OrderedDict, defaultdict
 import time
+import pandas as pd
 import re
 import os
 import json
 import random
 import aiohttp
-import pandas as pd
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -54,65 +54,12 @@ from financials import (
 
 from ai_service import ai_service
 
-# ============= YFINANCE FUNDAMENTALS FETCHER =============
-
-async def fetch_yf_fundamentals(symbol: str) -> Dict:
-    """Fetch ONLY missing fundamental data from yFinance"""
-    try:
-        if yf_rate_limiter.is_blocked():
-            return {}
-        
-        await yf_rate_limiter.acquire()
-        loop = asyncio.get_event_loop()
-        stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
-        info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
-        
-        if not info:
-            return {}
-        
-        # Only extract the fundamental metrics we need
-        fundamentals = {}
-        
-        if info.get('trailingPE') is not None:
-            fundamentals['trailingPE'] = float(info['trailingPE'])
-        if info.get('priceToBook') is not None:
-            fundamentals['priceToBook'] = float(info['priceToBook'])
-        if info.get('trailingEps') is not None:
-            fundamentals['trailingEps'] = float(info['trailingEps'])
-        if info.get('returnOnEquity') is not None:
-            fundamentals['returnOnEquity'] = float(info['returnOnEquity'])
-        if info.get('returnOnAssets') is not None:
-            fundamentals['returnOnAssets'] = float(info['returnOnAssets'])
-        if info.get('debtToEquity') is not None:
-            fundamentals['debtToEquity'] = float(info['debtToEquity'])
-        if info.get('dividendYield') is not None:
-            fundamentals['dividendYield'] = float(info['dividendYield'])
-        if info.get('averageVolume') is not None:
-            fundamentals['averageVolume'] = float(info['averageVolume'])
-        if info.get('fiftyTwoWeekHigh') is not None:
-            fundamentals['fiftyTwoWeekHigh'] = float(info['fiftyTwoWeekHigh'])
-        if info.get('fiftyTwoWeekLow') is not None:
-            fundamentals['fiftyTwoWeekLow'] = float(info['fiftyTwoWeekLow'])
-        if info.get('marketCap') is not None:
-            fundamentals['marketCap'] = float(info['marketCap'])
-        if info.get('sharesOutstanding') is not None:
-            fundamentals['sharesOutstanding'] = float(info['sharesOutstanding'])
-        
-        logger.debug(f"Fetched {len(fundamentals)} fundamentals from yFinance for {symbol}")
-        return fundamentals
-    except asyncio.TimeoutError:
-        logger.debug(f"yFinance fundamentals timeout for {symbol}")
-        return {}
-    except Exception as e:
-        logger.debug(f"Could not fetch fundamentals from yFinance for {symbol}: {type(e).__name__}")
-        return {}
-
 # ============= OPTIMIZED HYBRID DATA ENGINE =============
 
 class HybridDataEngine:
     """
-    Hybrid data provider with cascading fallback:
-    Finnhub (fastest real-time) → Alpha Vantage → yFinance (ultimate fallback)
+    OPTIMIZED Hybrid data provider with cascading fallback:
+    Finnhub (fastest real-time) → Alpha Vantage (best fundamentals) → yFinance (ultimate fallback)
     """
     
     def __init__(self):
@@ -123,6 +70,12 @@ class HybridDataEngine:
         self.fh_calls = 0
         self.fh_success = 0
         self.fh_calls_minute = []
+        # FIXED: Finnhub's free tier does not include the historical
+        # candles endpoint (stock_candles) — it returns a permanent
+        # 403 "You don't have access to this resource." Once we see
+        # that, stop wasting a network round-trip on it for the rest
+        # of this process's lifetime; quote/company-profile calls are
+        # unaffected and keep working normally on the free tier.
         self.fh_historical_available = True
 
         # Alpha Vantage (Priority 2 - Best fundamentals)
@@ -134,12 +87,16 @@ class HybridDataEngine:
         self.av_calls_minute = []
         self.av_calls_day = []
         self.av_day_reset = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # FIXED: Alpha Vantage's actual free-tier daily limit is 25
+        # requests/day, not 500. The old 500 cap meant the app kept
+        # firing requests at AV long after the real quota was gone,
+        # burning time on calls that were guaranteed to be rejected.
         self.av_daily_limit = int(os.getenv("ALPHA_VANTAGE_DAILY_LIMIT", 25))
 
-        # Cache
+        # Cache (optimized with shorter TTL for real-time)
         self.cache = {}
-        self.quote_cache_ttl = 30
-        self.historical_cache_ttl = 300
+        self.quote_cache_ttl = 30  # 30 seconds for real-time quotes
+        self.historical_cache_ttl = 300  # 5 minutes for historical
         
         # Stats
         self.yf_calls = 0
@@ -148,10 +105,11 @@ class HybridDataEngine:
         logger.info(f"🚀 Hybrid Engine initialized: FH={self.fh_enabled}, AV={self.av_enabled}")
     
     # ========================================================================
-    # FINNHUB METHODS
+    # FINNHUB METHODS (Priority 1 - Fastest)
     # ========================================================================
     
     def _can_call_fh(self) -> bool:
+        """Check Finnhub rate limit (60/min free)"""
         now = time.time()
         self.fh_calls_minute = [t for t in self.fh_calls_minute if now - t < 60]
         return len(self.fh_calls_minute) < 60
@@ -161,6 +119,7 @@ class HybridDataEngine:
         self.fh_calls_minute.append(time.time())
     
     async def _fetch_fh_quote(self, symbol: str) -> Optional[Dict]:
+        """Fetch quote from Finnhub - FASTEST real-time data"""
         if not self.fh_enabled or not self._can_call_fh():
             return None
         
@@ -188,10 +147,12 @@ class HybridDataEngine:
         return None
     
     async def _fetch_fh_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
+        """Fetch historical from Finnhub"""
         if not self.fh_enabled or not self._can_call_fh():
             return None
         
         try:
+            # Map period to resolution
             end = datetime.now()
             if period == "1d":
                 start = end - timedelta(days=2)
@@ -208,7 +169,7 @@ class HybridDataEngine:
             elif period == "6mo":
                 start = end - timedelta(days=180)
                 resolution = "D"
-            else:
+            else:  # 1y
                 start = end - timedelta(days=365)
                 resolution = "D"
             
@@ -246,11 +207,17 @@ class HybridDataEngine:
         return None
     
     async def _fetch_fh_company_info(self, symbol: str) -> Optional[Dict]:
+        """Fetch company profile from Finnhub"""
         if not self.fh_enabled or not self._can_call_fh():
             return None
         
         try:
             loop = asyncio.get_event_loop()
+            # FIXED: company_profile2(**params) only accepts keyword
+            # arguments — passing symbol positionally (the old code) threw
+            # "takes 1 positional argument but 2 were given" on every
+            # single call, silently killing Finnhub's company info tier
+            # regardless of plan/API key validity.
             profile = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: self.fh_client.company_profile2(symbol=symbol)),
                 timeout=8
@@ -259,6 +226,13 @@ class HybridDataEngine:
             
             if profile:
                 self.fh_success += 1
+                # FIXED: Finnhub returns marketCapitalization in MILLIONS
+                # of the reporting currency (their documented convention),
+                # not raw dollars — unlike Alpha Vantage's
+                # MarketCapitalization field, which already is raw
+                # dollars. Storing it unconverted made every FH-sourced
+                # market cap display 1,000,000x too small (e.g. AAPL's
+                # true ~$4.6T showing as "$4.60M").
                 raw_market_cap = profile.get('marketCapitalization', 0)
                 return {
                     "company_name": profile.get('name'),
@@ -272,10 +246,11 @@ class HybridDataEngine:
         return None
     
     # ========================================================================
-    # ALPHA VANTAGE METHODS
+    # ALPHA VANTAGE METHODS (Priority 2 - Best fundamentals)
     # ========================================================================
     
     def _can_call_av(self) -> bool:
+        """Check Alpha Vantage rate limit (5/min, 25/day on free tier)"""
         now = time.time()
         self.av_calls_minute = [t for t in self.av_calls_minute if now - t < 60]
         if len(self.av_calls_minute) >= 5:
@@ -296,6 +271,7 @@ class HybridDataEngine:
         self.av_calls_day.append(now)
     
     async def _fetch_av_quote(self, symbol: str) -> Optional[Dict]:
+        """Fetch quote from Alpha Vantage"""
         if not self.av_enabled or not self._can_call_av():
             return None
         
@@ -328,6 +304,9 @@ class HybridDataEngine:
                                 "source": "Alpha Vantage",
                                 "latency": "slightly delayed"
                             }
+                    # AV returns rate-limit/error messages as HTTP 200 with
+                    # a message field instead of an actual quote — these
+                    # were previously silent. Surface them.
                     if any(k in data for k in ("Error Message", "Note", "Information")):
                         logger.warning(f"Alpha Vantage quote rejected for {symbol}: {data}")
         except Exception as e:
@@ -335,6 +314,7 @@ class HybridDataEngine:
         return None
     
     async def _fetch_av_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
+        """Fetch historical from Alpha Vantage"""
         if not self.av_enabled or not self._can_call_av():
             return None
         
@@ -387,6 +367,7 @@ class HybridDataEngine:
         return None
     
     async def _fetch_av_company_info(self, symbol: str) -> Optional[Dict]:
+        """Fetch company overview from Alpha Vantage (BEST FUNDAMENTALS)"""
         if not self.av_enabled or not self._can_call_av():
             return None
         
@@ -404,6 +385,14 @@ class HybridDataEngine:
                     
                     if data and "Symbol" in data:
                         self.av_success += 1
+                        # NOTE: Alpha Vantage's OVERVIEW endpoint has no
+                        # "DebtToEquity" field at all — it never existed in
+                        # their schema. The old code did
+                        # data.get("DebtToEquity", 0), which silently faked
+                        # every single stock as debt-free (D/E = 0.00)
+                        # instead of correctly reporting "unavailable".
+                        # Also "RevenueGrowth" isn't a real AV field either;
+                        # the correct key is "QuarterlyRevenueGrowthYOY".
                         result = {
                             "symbol": data.get("Symbol"),
                             "company_name": data.get("Name"),
@@ -417,6 +406,10 @@ class HybridDataEngine:
                             "dividend_yield": float(data.get("DividendYield", "0").replace("%", "")),
                             "eps": float(data.get("EPS", 0)),
                         }
+                        # These two genuinely aren't in AV's schema — only
+                        # include them if a value is actually present,
+                        # so downstream correctly treats them as unknown
+                        # (N/A) rather than a fake confident zero.
                         if data.get("DebtToEquity") not in (None, "None", "-", ""):
                             result["debt_to_equity"] = float(data["DebtToEquity"])
                         if data.get("QuarterlyRevenueGrowthYOY") not in (None, "None", "-", ""):
@@ -427,10 +420,11 @@ class HybridDataEngine:
         return None
     
     # ========================================================================
-    # YFINANCE METHODS (Fallback)
+    # YFINANCE METHODS (Priority 3 - Ultimate fallback)
     # ========================================================================
     
     async def _fetch_yf_quote(self, symbol: str) -> Optional[Dict]:
+        """Fetch quote from yFinance (fallback)"""
         if yf_rate_limiter.is_blocked():
             return None
             
@@ -464,6 +458,7 @@ class HybridDataEngine:
         return None
     
     async def _fetch_yf_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
+        """Fetch historical from yFinance (fallback)"""
         if yf_rate_limiter.is_blocked():
             return None
             
@@ -498,6 +493,7 @@ class HybridDataEngine:
         return None
     
     async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
+        """Fetch company info from yFinance (fallback)"""
         if yf_rate_limiter.is_blocked():
             return None
             
@@ -523,22 +519,27 @@ class HybridDataEngine:
     # ========================================================================
     
     async def get_quote(self, symbol: str) -> Optional[Dict]:
+        """Get real-time quote with cascading fallback"""
+        
         cache_key = f"quote:{symbol}"
         if cache_key in self.cache:
             cached, ts = self.cache[cache_key]
             if time.time() - ts < self.quote_cache_ttl:
                 return cached
         
+        # Priority 1: Finnhub (Fastest real-time)
         result = await self._fetch_fh_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
         
+        # Priority 2: Alpha Vantage (Good backup)
         result = await self._fetch_av_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
         
+        # Priority 3: yFinance (Ultimate fallback)
         result = await self._fetch_yf_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
@@ -547,22 +548,27 @@ class HybridDataEngine:
         return None
     
     async def get_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
+        """Get historical data with cascading fallback"""
+        
         cache_key = f"hist:{symbol}:{period}:{interval}"
         if cache_key in self.cache:
             cached, ts = self.cache[cache_key]
             if time.time() - ts < self.historical_cache_ttl:
                 return cached
         
+        # Priority 1: Finnhub (Fastest)
         result = await self._fetch_fh_historical(symbol, period)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
         
+        # Priority 2: Alpha Vantage (Good data)
         result = await self._fetch_av_historical(symbol, period)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
         
+        # Priority 3: yFinance (Ultimate fallback)
         result = await self._fetch_yf_historical(symbol, period, interval)
         if result:
             self.cache[cache_key] = (result, time.time())
@@ -571,14 +577,30 @@ class HybridDataEngine:
         return None
     
     async def get_company_info(self, symbol: str) -> Optional[Dict]:
+        """Get company fundamentals with cascading fallback.
+
+        NOTE: Alpha Vantage and Finnhub return snake_case field names
+        (pe_ratio, market_cap, roe...), but everything downstream
+        (financials.py's calculators, build_stock_response) expects
+        yfinance's native camelCase schema (trailingPE, marketCap,
+        returnOnEquity...). Results from those two tiers are normalized
+        to that schema here — at the source — so every caller gets a
+        consistent shape regardless of which tier actually served the
+        data. yFinance's own result is already in the right schema and
+        is returned unchanged.
+        """
+
+        # Priority 1: Alpha Vantage (BEST fundamentals)
         result = await self._fetch_av_company_info(symbol)
         if result:
             return _map_av_fh_company_info_to_yf_schema(result)
         
+        # Priority 2: Finnhub (Good fundamentals)
         result = await self._fetch_fh_company_info(symbol)
         if result:
             return _map_av_fh_company_info_to_yf_schema(result)
         
+        # Priority 3: yFinance (Fallback) — already yfinance-native schema
         result = await self._fetch_yf_company_info(symbol)
         if result:
             return result
@@ -586,9 +608,11 @@ class HybridDataEngine:
         return None
     
     async def get_indices(self, symbols: List[str]) -> List[Dict]:
+        """Get market indices data"""
         results = []
         for symbol in symbols:
             try:
+                # Try Finnhub first
                 quote = await self._fetch_fh_quote(symbol)
                 if quote:
                     results.append({
@@ -600,6 +624,7 @@ class HybridDataEngine:
                     })
                     continue
                 
+                # Try yFinance for indices
                 quote = await self._fetch_yf_quote(symbol)
                 if quote:
                     results.append({
@@ -630,6 +655,7 @@ class HybridDataEngine:
         return names.get(symbol, symbol)
     
     def get_stats(self) -> Dict:
+        """Get engine statistics"""
         now = time.time()
         return {
             "finnhub": {
@@ -659,9 +685,14 @@ class YFinanceRateLimiter:
         self.calls = []
         self.max_calls = max_calls_per_minute
         self.lock = asyncio.Lock()
+        # Circuit breaker: when Yahoo is actively rate-limiting/blocking us
+        # (common on cloud hosts like Render), repeatedly retrying every
+        # ~60s per symbol just wastes calls and floods the logs without
+        # ever succeeding. After enough consecutive failures, stop calling
+        # yfinance entirely for a cooldown window.
         self.consecutive_failures = 0
         self.failure_threshold = 5
-        self.cooldown_seconds = 300
+        self.cooldown_seconds = 300  # 5 minutes
         self.blocked_until = 0
 
     def is_blocked(self) -> bool:
@@ -809,6 +840,12 @@ class LRUCache:
 
 stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
 chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
+# Long-lived cache of the last successfully fetched REAL data per symbol
+# (6 hour TTL). Checked before ever falling back to the hardcoded demo
+# dataset, so a transient yfinance/Finnhub/AlphaVantage hiccup shows a
+# slightly stale REAL price instead of swapping to a fake one — this is
+# what was causing prices to visibly "jump" between the real quote and
+# the hardcoded fallback number.
 last_good_stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
 last_good_chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
 yf_rate_limiter = YFinanceRateLimiter(max_calls_per_minute=25)
@@ -911,6 +948,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ============= BACKGROUND TASKS =============
 async def _fetch_indices_internal() -> list:
+    """Internal function to fetch market indices using hybrid engine"""
     indices_config = [
         '^GSPC', '^IXIC', '^DJI', '^RUT', '^VIX',
         '^NSEI', '^BSESN', 'BTC-USD', 'GC=F', 'CL=F'
@@ -918,6 +956,7 @@ async def _fetch_indices_internal() -> list:
     return await hybrid_engine.get_indices(indices_config)
 
 async def market_updater():
+    """Periodically refresh market indices and push to WebSocket subscribers."""
     while True:
         try:
             stock_cache.delete_pattern("market:indices")
@@ -935,6 +974,7 @@ async def market_updater():
         await asyncio.sleep(60)
 
 async def price_updater():
+    """Push real-time price updates using hybrid engine"""
     last_prices: Dict[str, float] = {}
     consecutive_failures: Dict[str, int] = defaultdict(int)
     backoff_times: Dict[str, float] = defaultdict(float)
@@ -950,12 +990,14 @@ async def price_updater():
                         if backoff_times[symbol] > time.time():
                             continue
                         try:
+                            # Use hybrid engine for quote (fast)
                             quote = await hybrid_engine.get_quote(symbol)
                             
                             if quote and quote.get('price'):
                                 current_price = quote['price']
                                 change = quote.get('change_percent', 0)
                                 
+                                # Check if price changed significantly
                                 last_price = last_prices.get(symbol, current_price)
                                 if abs(current_price - last_price) > 0.05 or abs(change) > 0.5:
                                     await manager.broadcast_to_symbol(symbol, {
@@ -976,8 +1018,8 @@ async def price_updater():
                         except Exception as e:
                             logger.debug(f"Price update error for {symbol}: {e}")
                             consecutive_failures[symbol] += 1
-                    await asyncio.sleep(0.5)
-            update_interval = 5
+                    await asyncio.sleep(0.5)  # Faster updates
+            update_interval = 5  # Faster updates
             await asyncio.sleep(update_interval)
         except Exception as e:
             logger.error(f"Error in price updater: {e}")
@@ -1006,6 +1048,7 @@ def invalidate_symbol_cache(symbol: str):
     chart_cache.delete_pattern(symbol)
 
 def get_fallback_stock_data(symbol: str) -> Dict:
+    """Fallback data when all APIs fail"""
     fallback_prices = {
         "AAPL":  {"price": 175.50, "change": 0.5,  "company": "Apple Inc.",          "pe": 28.5, "market_cap": 2750000000000},
         "MSFT":  {"price": 420.75, "change": 0.3,  "company": "Microsoft Corp",       "pe": 35.2, "market_cap": 3120000000000},
@@ -1065,6 +1108,22 @@ def get_fallback_stock_data(symbol: str) -> Dict:
     }
 
 def _map_av_fh_company_info_to_yf_schema(company_info: Dict) -> Dict:
+    """
+    Translate Alpha Vantage / Finnhub's company_info output (snake_case:
+    pe_ratio, market_cap, roe, debt_to_equity...) into yfinance's native
+    camelCase schema (trailingPE, marketCap, returnOnEquity,
+    debtToEquity...), which is what financials.py's calculate_pe_ratio /
+    calculate_pb_ratio / calculate_roe / etc. and build_stock_response
+    actually read.
+
+    BUG THIS FIXES: company_info used to be merged directly, so a
+    successful Alpha Vantage or Finnhub fetch silently produced
+    Market Cap / P/E / P/B / EPS / ROE / D-E = N/A across the board (key
+    names never matched what the calculators looked for), even though
+    the real data had arrived. yFinance's own company info is already in
+    this schema and must NOT be passed through this mapper (it uses
+    different, snake_case-free key names already) — see get_company_info().
+    """
     if not company_info:
         return {}
 
@@ -1098,8 +1157,7 @@ def _map_av_fh_company_info_to_yf_schema(company_info: Dict) -> Dict:
     return mapped
 
 async def fetch_stock_data(symbol: str, use_cache: bool = True):
-    """Fetch stock data using hybrid engine with yFinance fundamentals fallback"""
-    
+    """Fetch stock data using hybrid engine with fallback"""
     cache_key = f"stock_data:{symbol}"
     if use_cache:
         cached = stock_cache.get(cache_key)
@@ -1143,27 +1201,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             if company_info:
                 info.update(company_info)
             
-            # ================================================================
-            # FIX: Fetch missing fundamentals from yFinance
-            # ================================================================
-            # Check if we're missing key fundamental metrics
-            missing_fundamentals = False
-            for key in ['trailingPE', 'priceToBook', 'trailingEps', 'returnOnEquity', 
-                        'returnOnAssets', 'debtToEquity', 'dividendYield', 'averageVolume']:
-                if key not in info or info.get(key) is None:
-                    missing_fundamentals = True
-                    break
-            
-            if missing_fundamentals:
-                logger.info(f"Missing fundamentals for {symbol}, fetching from yFinance...")
-                yf_fundamentals = await fetch_yf_fundamentals(symbol)
-                if yf_fundamentals:
-                    # Merge: only add if field doesn't exist or is None/0
-                    for key, value in yf_fundamentals.items():
-                        if key not in info or info.get(key) in (None, 0, 'N/A'):
-                            info[key] = value
-                    logger.info(f"Added {len(yf_fundamentals)} fundamentals from yFinance for {symbol}")
-            
             stock = MockStock(info)
             
             # Convert historical data to DataFrame
@@ -1187,7 +1224,10 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 stock_cache.set(cache_key, result)
             return result
 
-        # Ultimate fallback to yFinance
+        # Ultimate fallback to yFinance (timeout-bounded — see hybrid
+        # engine's _fetch_yf_* methods for why this matters: an unbounded
+        # yfinance call here could hang the whole /api/stock/{symbol}
+        # request well past the frontend's 30s timeout)
         await yf_rate_limiter.acquire()
         loop = asyncio.get_event_loop()
         try:
@@ -1358,9 +1398,13 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
             response_data = build_stock_response(symbol, stock, info, hist)
             if use_cache:
                 stock_cache.set(cache_key, response_data)
+            # Remember this as the last known-good REAL data for this symbol
             last_good_stock_cache.set(symbol, response_data)
             return response_data
 
+        # Live sources failed this round — prefer the last successfully
+        # fetched REAL data (even if a bit stale) over the hardcoded demo
+        # dataset, so the price doesn't visibly jump to a fake number.
         last_good = last_good_stock_cache.get(symbol)
         if last_good:
             logger.warning(f"Live fetch failed for {symbol} — serving last known-good real data")
@@ -1396,6 +1440,7 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             if cached:
                 return cached
 
+        # Use hybrid engine for historical data (fast)
         interval = "1d" if period in {"1mo", "3mo", "6mo", "1y"} else "1h"
         try:
             hist_data = await hybrid_engine.get_historical(symbol, period, interval)
@@ -1408,11 +1453,25 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             last_good_chart_cache.set(cache_key, hist_data)
             return hist_data
 
+        # NOTE: previously there was a second, redundant yfinance fallback
+        # attempt here — but hybrid_engine.get_historical() above already
+        # tries Finnhub → Alpha Vantage → yFinance internally (each leg
+        # now timeout-bounded). Calling yfinance a second time just added
+        # a duplicate unbounded network round-trip on top of the three the
+        # hybrid engine already made, which was the main reason chart
+        # requests could exceed the frontend's 30s timeout. Removed.
+
+        # Prefer the last successfully fetched REAL chart data (even if a
+        # bit stale) over randomly generated synthetic data — otherwise a
+        # transient failure makes the price history visibly jump between
+        # real and fake data on refresh.
         last_good = last_good_chart_cache.get(cache_key)
         if last_good:
             logger.warning(f"Live chart fetch failed for {symbol} — serving last known-good real chart data")
             return last_good
 
+        # Synthetic fallback data (only reached when we've never
+        # successfully fetched real chart data for this symbol/period)
         logger.info(f"Using synthetic chart data for {symbol} ({period}) — live sources unavailable")
         stock_data = get_fallback_stock_data(symbol)
         base_price = stock_data.get('current_price', 100)
@@ -1574,6 +1633,7 @@ async def analyze_sentiment(request: dict, req: Request = None):
 
 @app.get("/api/market-indices")
 async def get_market_indices(use_cache: bool = True):
+    """Get major market indices using hybrid engine"""
     cache_key = "market:indices"
     if use_cache:
         cached = stock_cache.get(cache_key)
@@ -1673,6 +1733,7 @@ async def debug_stock(symbol: str):
             "tests": []
         }
         
+        # Test hybrid engine quote
         quote = await hybrid_engine.get_quote(symbol)
         result["tests"].append({
             "name": "hybrid_quote",
@@ -1680,6 +1741,7 @@ async def debug_stock(symbol: str):
             "data": quote
         })
         
+        # Test hybrid engine historical
         hist = await hybrid_engine.get_historical(symbol, "1mo")
         result["tests"].append({
             "name": "hybrid_historical",
@@ -1687,19 +1749,12 @@ async def debug_stock(symbol: str):
             "count": len(hist) if hist else 0
         })
         
+        # Test hybrid engine company info
         info = await hybrid_engine.get_company_info(symbol)
         result["tests"].append({
             "name": "hybrid_company",
             "success": bool(info),
             "company": info.get('company_name') if info else None
-        })
-        
-        # Also test yFinance fundamentals fetch
-        yf_fund = await fetch_yf_fundamentals(symbol)
-        result["tests"].append({
-            "name": "yfinance_fundamentals",
-            "success": bool(yf_fund),
-            "keys": list(yf_fund.keys()) if yf_fund else []
         })
         
         return result
