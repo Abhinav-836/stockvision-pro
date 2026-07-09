@@ -17,6 +17,7 @@ import os
 import json
 import random
 import aiohttp
+import pandas as pd
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -1204,7 +1205,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             
             # Convert historical data to DataFrame
             if hist_data:
-                import pandas as pd
                 df_data = []
                 for item in hist_data:
                     df_data.append({
