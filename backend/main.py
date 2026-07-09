@@ -225,10 +225,18 @@ class HybridDataEngine:
             
             if profile:
                 self.fh_success += 1
+                # FIXED: Finnhub returns marketCapitalization in MILLIONS
+                # of the reporting currency (their documented convention),
+                # not raw dollars — unlike Alpha Vantage's
+                # MarketCapitalization field, which already is raw
+                # dollars. Storing it unconverted made every FH-sourced
+                # market cap display 1,000,000x too small (e.g. AAPL's
+                # true ~$4.6T showing as "$4.60M").
+                raw_market_cap = profile.get('marketCapitalization', 0)
                 return {
                     "company_name": profile.get('name'),
                     "sector": profile.get('finnhubIndustry'),
-                    "market_cap": float(profile.get('marketCapitalization', 0)),
+                    "market_cap": float(raw_market_cap) * 1_000_000,
                     "exchange": profile.get('exchange'),
                     "country": profile.get('country'),
                 }
@@ -241,7 +249,7 @@ class HybridDataEngine:
     # ========================================================================
     
     def _can_call_av(self) -> bool:
-        """Check Alpha Vantage rate limit (5/min, 500/day)"""
+        """Check Alpha Vantage rate limit (5/min, 25/day on free tier)"""
         now = time.time()
         self.av_calls_minute = [t for t in self.av_calls_minute if now - t < 60]
         if len(self.av_calls_minute) >= 5:
@@ -253,7 +261,7 @@ class HybridDataEngine:
             self.av_day_reset = today
         
         self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
-        return len(self.av_calls_day) < 500
+        return len(self.av_calls_day) < self.av_daily_limit
     
     def _record_av_call(self):
         now = time.time()
@@ -416,19 +424,12 @@ class HybridDataEngine:
     
     async def _fetch_yf_quote(self, symbol: str) -> Optional[Dict]:
         """Fetch quote from yFinance (fallback)"""
+        if yf_rate_limiter.is_blocked():
+            return None
+            
         try:
-            # FIXED: this call previously bypassed yf_rate_limiter entirely,
-            # so it could fire concurrently with other yfinance calls
-            # (historical, company info, chart endpoint) and trip Yahoo's
-            # anti-scraping throttling — causing intermittent failures that
-            # made the app fall back to fake demo data.
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
-            # FIXED: yfinance calls have no built-in timeout (unlike
-            # Finnhub's 10s and Alpha Vantage's aiohttp timeout=8/12).
-            # Wrapped in wait_for so a stalled connection can no longer
-            # hang the whole cascading-fallback chain past the frontend's
-            # 30s request timeout.
             stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
             info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
             self.yf_calls += 1
@@ -436,6 +437,7 @@ class HybridDataEngine:
             price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
             if price:
                 self.yf_success += 1
+                yf_rate_limiter.record_success()
                 return {
                     "price": float(price),
                     "change": float(info.get('regularMarketChange', 0)),
@@ -448,12 +450,17 @@ class HybridDataEngine:
                     "source": "yFinance",
                     "latency": "delayed"
                 }
+            yf_rate_limiter.record_failure()
         except Exception as e:
             logger.warning(f"yFinance quote error for {symbol}: {type(e).__name__}: {e}")
+            yf_rate_limiter.record_failure()
         return None
     
     async def _fetch_yf_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
         """Fetch historical from yFinance (fallback)"""
+        if yf_rate_limiter.is_blocked():
+            return None
+            
         try:
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
@@ -466,6 +473,7 @@ class HybridDataEngine:
             
             if hist is not None and not hist.empty:
                 self.yf_success += 1
+                yf_rate_limiter.record_success()
                 result = []
                 for date, row in hist.iterrows():
                     result.append({
@@ -477,12 +485,17 @@ class HybridDataEngine:
                         "volume": int(row['Volume']) if 'Volume' in row else 0
                     })
                 return result
+            yf_rate_limiter.record_failure()
         except Exception as e:
             logger.warning(f"yFinance historical error for {symbol}: {type(e).__name__}: {e}")
+            yf_rate_limiter.record_failure()
         return None
     
     async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
         """Fetch company info from yFinance (fallback)"""
+        if yf_rate_limiter.is_blocked():
+            return None
+            
         try:
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
@@ -492,9 +505,12 @@ class HybridDataEngine:
             
             if info:
                 self.yf_success += 1
+                yf_rate_limiter.record_success()
                 return info
+            yf_rate_limiter.record_failure()
         except Exception as e:
             logger.warning(f"yFinance company info error for {symbol}: {type(e).__name__}: {e}")
+            yf_rate_limiter.record_failure()
         return None
     
     # ========================================================================
@@ -668,6 +684,31 @@ class YFinanceRateLimiter:
         self.calls = []
         self.max_calls = max_calls_per_minute
         self.lock = asyncio.Lock()
+        # Circuit breaker: when Yahoo is actively rate-limiting/blocking us
+        # (common on cloud hosts like Render), repeatedly retrying every
+        # ~60s per symbol just wastes calls and floods the logs without
+        # ever succeeding. After enough consecutive failures, stop calling
+        # yfinance entirely for a cooldown window.
+        self.consecutive_failures = 0
+        self.failure_threshold = 5
+        self.cooldown_seconds = 300  # 5 minutes
+        self.blocked_until = 0
+
+    def is_blocked(self) -> bool:
+        return time.time() < self.blocked_until
+
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.blocked_until = 0
+
+    def record_failure(self):
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            self.blocked_until = time.time() + self.cooldown_seconds
+            logger.warning(
+                f"yFinance circuit breaker OPEN after {self.consecutive_failures} "
+                f"consecutive failures — skipping yFinance calls for {self.cooldown_seconds}s"
+            )
 
     async def acquire(self):
         async with self.lock:
