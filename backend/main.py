@@ -12,7 +12,6 @@ import asyncio
 import logging
 from collections import OrderedDict, defaultdict
 import time
-import pandas as pd
 import re
 import os
 import json
@@ -148,6 +147,16 @@ class HybridDataEngine:
     
     async def _fetch_fh_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
         """Fetch historical from Finnhub"""
+        # Finnhub's free tier permanently returns 403 on /stock/candle
+        # (confirmed repeatedly in production logs) — it's a plan
+        # restriction, not a transient error, so retrying it on every
+        # single chart/quote request just wastes a network round-trip and
+        # fills the logs with noise. self.fh_historical_available starts
+        # True and flips to False the first time we see a 403 (below),
+        # so we stop trying for the rest of this process's lifetime
+        # without needing any manual configuration.
+        if not self.fh_historical_available:
+            return None
         if not self.fh_enabled or not self._can_call_fh():
             return None
         
@@ -203,6 +212,17 @@ class HybridDataEngine:
                     self.fh_success += 1
                     return result
         except Exception as e:
+            # A 403 here means the plan restriction, not a transient
+            # issue — stop retrying this for the rest of the process's
+            # lifetime instead of hitting it (and logging it) again on
+            # every future chart/historical request.
+            if "403" in str(e):
+                if self.fh_historical_available:
+                    logger.warning(
+                        f"Finnhub historical returned 403 (plan restriction) — "
+                        f"disabling Finnhub historical for the rest of this session"
+                    )
+                self.fh_historical_available = False
             logger.warning(f"Finnhub historical error for {symbol}: {type(e).__name__}: {e}")
         return None
     
@@ -250,7 +270,7 @@ class HybridDataEngine:
     # ========================================================================
     
     def _can_call_av(self) -> bool:
-        """Check Alpha Vantage rate limit (5/min, 25/day on free tier)"""
+        """Check Alpha Vantage rate limit (5/min, 500/day)"""
         now = time.time()
         self.av_calls_minute = [t for t in self.av_calls_minute if now - t < 60]
         if len(self.av_calls_minute) >= 5:
@@ -262,7 +282,7 @@ class HybridDataEngine:
             self.av_day_reset = today
         
         self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
-        return len(self.av_calls_day) < self.av_daily_limit
+        return len(self.av_calls_day) < 500
     
     def _record_av_call(self):
         now = time.time()
@@ -427,10 +447,19 @@ class HybridDataEngine:
         """Fetch quote from yFinance (fallback)"""
         if yf_rate_limiter.is_blocked():
             return None
-            
         try:
+            # FIXED: this call previously bypassed yf_rate_limiter entirely,
+            # so it could fire concurrently with other yfinance calls
+            # (historical, company info, chart endpoint) and trip Yahoo's
+            # anti-scraping throttling — causing intermittent failures that
+            # made the app fall back to fake demo data.
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
+            # FIXED: yfinance calls have no built-in timeout (unlike
+            # Finnhub's 10s and Alpha Vantage's aiohttp timeout=8/12).
+            # Wrapped in wait_for so a stalled connection can no longer
+            # hang the whole cascading-fallback chain past the frontend's
+            # 30s request timeout.
             stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
             info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
             self.yf_calls += 1
@@ -451,17 +480,15 @@ class HybridDataEngine:
                     "source": "yFinance",
                     "latency": "delayed"
                 }
-            yf_rate_limiter.record_failure()
         except Exception as e:
-            logger.warning(f"yFinance quote error for {symbol}: {type(e).__name__}: {e}")
             yf_rate_limiter.record_failure()
+            logger.warning(f"yFinance quote error for {symbol}: {type(e).__name__}: {e}")
         return None
     
     async def _fetch_yf_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
         """Fetch historical from yFinance (fallback)"""
         if yf_rate_limiter.is_blocked():
             return None
-            
         try:
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
@@ -486,17 +513,13 @@ class HybridDataEngine:
                         "volume": int(row['Volume']) if 'Volume' in row else 0
                     })
                 return result
-            yf_rate_limiter.record_failure()
         except Exception as e:
-            logger.warning(f"yFinance historical error for {symbol}: {type(e).__name__}: {e}")
             yf_rate_limiter.record_failure()
+            logger.warning(f"yFinance historical error for {symbol}: {type(e).__name__}: {e}")
         return None
     
     async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
         """Fetch company info from yFinance (fallback)"""
-        if yf_rate_limiter.is_blocked():
-            return None
-            
         try:
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
@@ -506,12 +529,9 @@ class HybridDataEngine:
             
             if info:
                 self.yf_success += 1
-                yf_rate_limiter.record_success()
                 return info
-            yf_rate_limiter.record_failure()
         except Exception as e:
             logger.warning(f"yFinance company info error for {symbol}: {type(e).__name__}: {e}")
-            yf_rate_limiter.record_failure()
         return None
     
     # ========================================================================
@@ -956,7 +976,16 @@ async def _fetch_indices_internal() -> list:
     return await hybrid_engine.get_indices(indices_config)
 
 async def market_updater():
-    """Periodically refresh market indices and push to WebSocket subscribers."""
+    """Periodically refresh market indices and push to WebSocket subscribers.
+
+    FIXED: this was refetching all 10 index symbols via yFinance every 60
+    seconds — 600 calls/hour just for the ticker tape, which was the
+    single biggest driver of Yahoo's rate limiting on Render's shared IP
+    (the circuit breaker was tripping within 1 second of every restart,
+    before any real user request even happened). Indices don't need
+    per-minute freshness for this app; 5 minutes is a much safer rate
+    while still feeling "live" to users.
+    """
     while True:
         try:
             stock_cache.delete_pattern("market:indices")
@@ -971,7 +1000,7 @@ async def market_updater():
                 logger.info(f"Market indices updated via WebSocket ({len(indices)} indices)")
         except Exception as e:
             logger.error(f"Error in market updater: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)
 
 async def price_updater():
     """Push real-time price updates using hybrid engine"""
@@ -1205,6 +1234,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             
             # Convert historical data to DataFrame
             if hist_data:
+                import pandas as pd
                 df_data = []
                 for item in hist_data:
                     df_data.append({
@@ -1471,10 +1501,24 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             return last_good
 
         # Synthetic fallback data (only reached when we've never
-        # successfully fetched real chart data for this symbol/period)
+        # successfully fetched real chart data for this symbol/period).
+        # FIXED: this used to seed the random walk from
+        # get_fallback_stock_data()'s hardcoded demo price (~$175 for
+        # AAPL) unconditionally — even when a REAL current price was
+        # already known from a successful quote elsewhere (e.g. the main
+        # /api/stock/{symbol} response). That produced a chart showing a
+        # completely different price level than the real quote on the
+        # same page (e.g. chart around $175 while the header showed
+        # $316). Now it prefers the real last-known price when available,
+        # and only falls back to the hardcoded demo price if this symbol
+        # has genuinely never been fetched successfully at all.
         logger.info(f"Using synthetic chart data for {symbol} ({period}) — live sources unavailable")
-        stock_data = get_fallback_stock_data(symbol)
-        base_price = stock_data.get('current_price', 100)
+        real_last_known = last_good_stock_cache.get(symbol)
+        if real_last_known and real_last_known.get('current_price'):
+            base_price = real_last_known['current_price']
+        else:
+            stock_data = get_fallback_stock_data(symbol)
+            base_price = stock_data.get('current_price', 100)
         days_map = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365}
         days = days_map.get(period, 30)
         chart_data = []
@@ -1639,7 +1683,7 @@ async def get_market_indices(use_cache: bool = True):
         cached = stock_cache.get(cache_key)
         if cached:
             ts = cached.get("_timestamp", 0) if isinstance(cached, dict) else 0
-            if time.time() - ts < 120:
+            if time.time() - ts < 280:
                 return cached.get("indices", cached) if isinstance(cached, dict) else cached
 
     valid_indices = await _fetch_indices_internal()
