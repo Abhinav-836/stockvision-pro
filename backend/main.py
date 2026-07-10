@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import yfinance as yf
 import numpy as np
+import pandas as pd
 import asyncio
 import logging
 from collections import OrderedDict, defaultdict
@@ -1234,7 +1235,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             
             # Convert historical data to DataFrame
             if hist_data:
-                import pandas as pd
                 df_data = []
                 for item in hist_data:
                     df_data.append({
