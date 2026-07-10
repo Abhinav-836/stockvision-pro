@@ -1234,6 +1234,13 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             stock = MockStock(info)
             
             # Convert historical data to DataFrame
+            # FIXED: pandas was only imported inside the `if hist_data:`
+            # branch — when hist_data was falsy (increasingly common now
+            # that Finnhub/AV fail more often), the `else` branch tried to
+            # use `pd` on a code path where it had never been bound,
+            # raising "cannot access local variable 'pd'" and crashing
+            # the entire request instead of gracefully falling through to
+            # cached/fallback data as intended.
             if hist_data:
                 df_data = []
                 for item in hist_data:
