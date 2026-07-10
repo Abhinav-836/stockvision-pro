@@ -8,7 +8,6 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import yfinance as yf
 import numpy as np
-import pandas as pd
 import asyncio
 import logging
 from collections import OrderedDict, defaultdict
@@ -1241,6 +1240,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             # raising "cannot access local variable 'pd'" and crashing
             # the entire request instead of gracefully falling through to
             # cached/fallback data as intended.
+            import pandas as pd
             if hist_data:
                 df_data = []
                 for item in hist_data:
@@ -1516,14 +1516,33 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
         # /api/stock/{symbol} response). That produced a chart showing a
         # completely different price level than the real quote on the
         # same page (e.g. chart around $175 while the header showed
-        # $316). Now it prefers the real last-known price when available,
-        # and only falls back to the hardcoded demo price if this symbol
-        # has genuinely never been fetched successfully at all.
+        # $316).
+        #
+        # FIXED (round 2): checking last_good_stock_cache alone isn't
+        # enough — the frontend fires the chart request and the main
+        # stock-analysis request in PARALLEL (intentionally, for speed),
+        # so on a cold cache the chart request frequently finishes first,
+        # before /api/stock/{symbol} has had a chance to populate
+        # last_good_stock_cache with the real price at all. That race
+        # meant this "fix" often silently did nothing. Now, if the cache
+        # is empty, we fetch a live quote directly as a last resort
+        # before falling to the fully-synthetic demo price — quote calls
+        # are cheap/fast (a single lightweight request, not historical),
+        # so this rarely fails even when historical data is unavailable.
         logger.info(f"Using synthetic chart data for {symbol} ({period}) — live sources unavailable")
+        base_price = None
         real_last_known = last_good_stock_cache.get(symbol)
         if real_last_known and real_last_known.get('current_price'):
             base_price = real_last_known['current_price']
         else:
+            try:
+                live_quote = await hybrid_engine.get_quote(symbol)
+                if live_quote and live_quote.get('price'):
+                    base_price = live_quote['price']
+            except Exception as e:
+                logger.warning(f"Live quote anchor fetch failed for {symbol}: {e}")
+
+        if base_price is None:
             stock_data = get_fallback_stock_data(symbol)
             base_price = stock_data.get('current_price', 100)
         days_map = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365}
