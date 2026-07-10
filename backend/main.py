@@ -1,4 +1,4 @@
-# backend/main.py — OPTIMIZED HYBRID ENGINE (Finnhub → Alpha Vantage → yFinance)
+# backend/main.py — OPTIMIZED HYBRID ENGINE (yFinance → Alpha Vantage → Finnhub)
 
 from fastapi import FastAPI, HTTPException, Request, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import yfinance as yf
 import numpy as np
+import pandas as pd
 import asyncio
 import logging
 from collections import OrderedDict, defaultdict
@@ -53,29 +54,183 @@ from financials import (
 
 from ai_service import ai_service
 
+# ============= RATE LIMITERS =============
+
+class YFinanceRateLimiter:
+    """Sophisticated rate limiter for yFinance with circuit breaker"""
+    
+    def __init__(self, max_calls_per_minute=30):
+        self.calls = []
+        self.max_calls = max_calls_per_minute
+        self.lock = asyncio.Lock()
+        
+        # Circuit breaker for yFinance
+        self.consecutive_failures = 0
+        self.failure_threshold = 5
+        self.cooldown_seconds = 180  # 3 minutes
+        self.blocked_until = 0
+        
+        # Stats
+        self.total_calls = 0
+        self.successful_calls = 0
+        
+    def is_blocked(self) -> bool:
+        """Check if yFinance is currently blocked"""
+        if time.time() < self.blocked_until:
+            return True
+        return False
+    
+    async def acquire(self) -> bool:
+        """Acquire a rate limit slot"""
+        if self.is_blocked():
+            return False
+            
+        async with self.lock:
+            now = time.time()
+            self.calls = [t for t in self.calls if now - t < 60]
+            
+            if len(self.calls) >= self.max_calls:
+                wait_time = 60 - (now - self.calls[0]) + 0.5
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+            
+            self.calls.append(time.time())
+            self.total_calls += 1
+            return True
+    
+    def record_success(self):
+        """Record a successful yFinance call"""
+        self.successful_calls += 1
+        self.consecutive_failures = 0
+        self.blocked_until = 0
+    
+    def record_failure(self):
+        """Record a failed yFinance call"""
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            self.blocked_until = time.time() + self.cooldown_seconds
+            logger.warning(
+                f"⚠️ yFinance circuit breaker OPEN after {self.consecutive_failures} "
+                f"consecutive failures — blocking for {self.cooldown_seconds}s"
+            )
+    
+    def get_stats(self) -> Dict:
+        now = time.time()
+        return {
+            "total_calls": self.total_calls,
+            "successful_calls": self.successful_calls,
+            "success_rate": f"{(self.successful_calls / self.total_calls * 100):.1f}%" if self.total_calls > 0 else "N/A",
+            "active_calls_last_minute": len([t for t in self.calls if now - t < 60]),
+            "is_blocked": self.is_blocked(),
+            "blocked_until": datetime.fromtimestamp(self.blocked_until).isoformat() if self.blocked_until > 0 else None
+        }
+
+
+class AlphaVantageRateLimiter:
+    """Rate limiter for Alpha Vantage API"""
+    
+    def __init__(self):
+        # Free tier: 5 calls per minute, 500 calls per day
+        self.minute_calls = []
+        self.day_calls = []
+        self.minute_limit = 5
+        self.day_limit = 500
+        self.lock = asyncio.Lock()
+        
+        # Circuit breaker
+        self.consecutive_failures = 0
+        self.failure_threshold = 10
+        self.cooldown_seconds = 300  # 5 minutes
+        self.blocked_until = 0
+        
+        # Stats
+        self.total_calls = 0
+        self.successful_calls = 0
+        
+        # Last reset time for day counter
+        self.day_reset = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    def is_blocked(self) -> bool:
+        return time.time() < self.blocked_until
+    
+    def can_call(self) -> bool:
+        """Check if we can make a call based on rate limits"""
+        if self.is_blocked():
+            return False
+        
+        now = time.time()
+        
+        # Check minute limit
+        self.minute_calls = [t for t in self.minute_calls if now - t < 60]
+        if len(self.minute_calls) >= self.minute_limit:
+            return False
+        
+        # Check day limit
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if today > self.day_reset:
+            self.day_calls = []
+            self.day_reset = today
+        
+        self.day_calls = [t for t in self.day_calls if t >= self.day_reset.timestamp()]
+        if len(self.day_calls) >= self.day_limit:
+            return False
+        
+        return True
+    
+    async def acquire(self) -> bool:
+        """Acquire a rate limit slot - returns False if rate limited"""
+        async with self.lock:
+            if not self.can_call():
+                return False
+            
+            now = time.time()
+            self.minute_calls.append(now)
+            self.day_calls.append(now)
+            self.total_calls += 1
+            return True
+    
+    def record_success(self):
+        self.successful_calls += 1
+        self.consecutive_failures = 0
+        self.blocked_until = 0
+    
+    def record_failure(self):
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            self.blocked_until = time.time() + self.cooldown_seconds
+            logger.warning(
+                f"⚠️ Alpha Vantage circuit breaker OPEN after {self.consecutive_failures} "
+                f"consecutive failures — blocking for {self.cooldown_seconds}s"
+            )
+    
+    def get_stats(self) -> Dict:
+        now = time.time()
+        return {
+            "total_calls": self.total_calls,
+            "successful_calls": self.successful_calls,
+            "success_rate": f"{(self.successful_calls / self.total_calls * 100):.1f}%" if self.total_calls > 0 else "N/A",
+            "calls_last_minute": len([t for t in self.minute_calls if now - t < 60]),
+            "calls_today": len([t for t in self.day_calls if t >= self.day_reset.timestamp()]),
+            "is_blocked": self.is_blocked(),
+            "blocked_until": datetime.fromtimestamp(self.blocked_until).isoformat() if self.blocked_until > 0 else None
+        }
+
 # ============= OPTIMIZED HYBRID DATA ENGINE =============
 
 class HybridDataEngine:
     """
     OPTIMIZED Hybrid data provider with cascading fallback:
-    Finnhub (fastest real-time) → Alpha Vantage (best fundamentals) → yFinance (ultimate fallback)
+    yFinance (most reliable) → Alpha Vantage (best fundamentals) → Finnhub (fastest real-time)
     """
     
     def __init__(self):
-        # Finnhub (Priority 1 - Fastest real-time)
-        self.fh_api_key = os.getenv("FINNHUB_API_KEY")
-        self.fh_enabled = bool(self.fh_api_key) and FINNHUB_AVAILABLE
-        self.fh_client = finnhub.Client(api_key=self.fh_api_key) if self.fh_enabled else None
-        self.fh_calls = 0
-        self.fh_success = 0
-        self.fh_calls_minute = []
-        # FIXED: Finnhub's free tier does not include the historical
-        # candles endpoint (stock_candles) — it returns a permanent
-        # 403 "You don't have access to this resource." Once we see
-        # that, stop wasting a network round-trip on it for the rest
-        # of this process's lifetime; quote/company-profile calls are
-        # unaffected and keep working normally on the free tier.
-        self.fh_historical_available = True
+        # Initialize rate limiters first
+        self.yf_limiter = YFinanceRateLimiter(max_calls_per_minute=30)
+        self.av_limiter = AlphaVantageRateLimiter()
+        
+        # yFinance (Priority 1 - Most reliable)
+        self.yf_calls = 0
+        self.yf_success = 0
 
         # Alpha Vantage (Priority 2 - Best fundamentals)
         self.av_api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -83,28 +238,286 @@ class HybridDataEngine:
         self.av_enabled = bool(self.av_api_key)
         self.av_calls = 0
         self.av_success = 0
-        self.av_calls_minute = []
-        self.av_calls_day = []
-        self.av_day_reset = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        # FIXED: Alpha Vantage's actual free-tier daily limit is 25
-        # requests/day, not 500. The old 500 cap meant the app kept
-        # firing requests at AV long after the real quota was gone,
-        # burning time on calls that were guaranteed to be rejected.
-        self.av_daily_limit = int(os.getenv("ALPHA_VANTAGE_DAILY_LIMIT", 25))
+
+        # Finnhub (Priority 3 - Fastest real-time)
+        self.fh_api_key = os.getenv("FINNHUB_API_KEY")
+        self.fh_enabled = bool(self.fh_api_key) and FINNHUB_AVAILABLE
+        self.fh_client = finnhub.Client(api_key=self.fh_api_key) if self.fh_enabled else None
+        self.fh_calls = 0
+        self.fh_success = 0
+        self.fh_calls_minute = []
+        self.fh_historical_available = True
 
         # Cache (optimized with shorter TTL for real-time)
         self.cache = {}
         self.quote_cache_ttl = 30  # 30 seconds for real-time quotes
         self.historical_cache_ttl = 300  # 5 minutes for historical
         
-        # Stats
-        self.yf_calls = 0
-        self.yf_success = 0
-        
-        logger.info(f"🚀 Hybrid Engine initialized: FH={self.fh_enabled}, AV={self.av_enabled}")
+        logger.info(f"🚀 Hybrid Engine initialized: yF=ON, AV={'ON' if self.av_enabled else 'OFF'}, FH={'ON' if self.fh_enabled else 'OFF'}")
     
     # ========================================================================
-    # FINNHUB METHODS (Priority 1 - Fastest)
+    # YFINANCE METHODS (Priority 1 - Most reliable)
+    # ========================================================================
+    
+    async def _fetch_yf_quote(self, symbol: str) -> Optional[Dict]:
+        """Fetch quote from yFinance - Most reliable"""
+        if self.yf_limiter.is_blocked():
+            return None
+            
+        try:
+            acquired = await self.yf_limiter.acquire()
+            if not acquired:
+                return None
+                
+            loop = asyncio.get_event_loop()
+            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=10)
+            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=10)
+            self.yf_calls += 1
+            
+            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+            if price:
+                self.yf_success += 1
+                self.yf_limiter.record_success()
+                return {
+                    "price": float(price),
+                    "change": float(info.get('regularMarketChange', 0)),
+                    "change_percent": float(info.get('regularMarketChangePercent', 0)),
+                    "volume": int(info.get('volume', 0)),
+                    "previous_close": float(info.get('previousClose', price)),
+                    "open": float(info.get('open', price)),
+                    "high": float(info.get('dayHigh', price)),
+                    "low": float(info.get('dayLow', price)),
+                    "source": "yFinance",
+                    "latency": "real-time"
+                }
+        except asyncio.TimeoutError:
+            logger.debug(f"yFinance quote timeout for {symbol}")
+            self.yf_limiter.record_failure()
+        except Exception as e:
+            self.yf_limiter.record_failure()
+            logger.warning(f"yFinance quote error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    async def _fetch_yf_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
+        """Fetch historical from yFinance"""
+        if self.yf_limiter.is_blocked():
+            return None
+            
+        try:
+            acquired = await self.yf_limiter.acquire()
+            if not acquired:
+                return None
+                
+            loop = asyncio.get_event_loop()
+            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=10)
+            hist = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: stock.history(period=period, interval=interval)),
+                timeout=15
+            )
+            self.yf_calls += 1
+            
+            if hist is not None and not hist.empty:
+                self.yf_success += 1
+                self.yf_limiter.record_success()
+                result = []
+                for date, row in hist.iterrows():
+                    result.append({
+                        "date": date.isoformat(),
+                        "price": round(float(row['Close']), 2),
+                        "open": round(float(row['Open']), 2),
+                        "high": round(float(row['High']), 2),
+                        "low": round(float(row['Low']), 2),
+                        "volume": int(row['Volume']) if 'Volume' in row else 0
+                    })
+                return result
+        except asyncio.TimeoutError:
+            logger.debug(f"yFinance historical timeout for {symbol}")
+            self.yf_limiter.record_failure()
+        except Exception as e:
+            self.yf_limiter.record_failure()
+            logger.warning(f"yFinance historical error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
+        """Fetch company info from yFinance - Most comprehensive"""
+        if self.yf_limiter.is_blocked():
+            return None
+            
+        try:
+            acquired = await self.yf_limiter.acquire()
+            if not acquired:
+                return None
+                
+            loop = asyncio.get_event_loop()
+            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=10)
+            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=10)
+            self.yf_calls += 1
+            
+            if info and info.get('symbol'):
+                self.yf_success += 1
+                self.yf_limiter.record_success()
+                return info
+        except asyncio.TimeoutError:
+            logger.debug(f"yFinance company info timeout for {symbol}")
+            self.yf_limiter.record_failure()
+        except Exception as e:
+            self.yf_limiter.record_failure()
+            logger.warning(f"yFinance company info error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    # ========================================================================
+    # ALPHA VANTAGE METHODS (Priority 2 - Best fundamentals backup)
+    # ========================================================================
+    
+    async def _fetch_av_quote(self, symbol: str) -> Optional[Dict]:
+        """Fetch quote from Alpha Vantage"""
+        if not self.av_enabled or self.av_limiter.is_blocked():
+            return None
+        
+        try:
+            acquired = await self.av_limiter.acquire()
+            if not acquired:
+                return None
+            
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": symbol,
+                "apikey": self.av_api_key
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.av_base_url, params=params, timeout=10) as response:
+                    data = await response.json()
+                    self.av_calls += 1
+                    
+                    quote = data.get("Global Quote", {})
+                    if quote and quote.get("05. price"):
+                        price = float(quote.get("05. price", 0))
+                        if price > 0:
+                            self.av_success += 1
+                            self.av_limiter.record_success()
+                            return {
+                                "price": price,
+                                "change": round(float(quote.get("09. change", 0)), 2),
+                                "change_percent": float(quote.get("10. change percent", "0%").replace("%", "")),
+                                "volume": int(quote.get("06. volume", 0)),
+                                "previous_close": float(quote.get("08. previous close", price)),
+                                "open": float(quote.get("02. open", price)),
+                                "high": float(quote.get("03. high", price)),
+                                "low": float(quote.get("04. low", price)),
+                                "source": "Alpha Vantage",
+                                "latency": "slightly delayed"
+                            }
+                    self.av_limiter.record_failure()
+        except Exception as e:
+            self.av_limiter.record_failure()
+            logger.warning(f"Alpha Vantage quote error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    async def _fetch_av_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
+        """Fetch historical from Alpha Vantage"""
+        if not self.av_enabled or self.av_limiter.is_blocked():
+            return None
+        
+        output_size = "compact" if period in ["1d", "5d", "1mo"] else "full"
+        
+        try:
+            acquired = await self.av_limiter.acquire()
+            if not acquired:
+                return None
+                
+            params = {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": symbol,
+                "outputsize": output_size,
+                "apikey": self.av_api_key
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.av_base_url, params=params, timeout=15) as response:
+                    data = await response.json()
+                    self.av_calls += 1
+                    
+                    if "Error Message" in data or "Note" in data or "Information" in data:
+                        self.av_limiter.record_failure()
+                        return None
+                    
+                    time_series = data.get("Time Series (Daily)", {})
+                    if time_series:
+                        result = []
+                        for date, values in sorted(time_series.items(), reverse=True)[:100]:
+                            try:
+                                result.append({
+                                    "date": date,
+                                    "price": float(values.get("4. close", 0)),
+                                    "open": float(values.get("1. open", 0)),
+                                    "high": float(values.get("2. high", 0)),
+                                    "low": float(values.get("3. low", 0)),
+                                    "volume": int(values.get("5. volume", 0))
+                                })
+                            except:
+                                continue
+                        
+                        if result:
+                            self.av_success += 1
+                            self.av_limiter.record_success()
+                            return result
+                    self.av_limiter.record_failure()
+        except Exception as e:
+            self.av_limiter.record_failure()
+            logger.warning(f"Alpha Vantage historical error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    async def _fetch_av_company_info(self, symbol: str) -> Optional[Dict]:
+        """Fetch company overview from Alpha Vantage"""
+        if not self.av_enabled or self.av_limiter.is_blocked():
+            return None
+        
+        try:
+            acquired = await self.av_limiter.acquire()
+            if not acquired:
+                return None
+                
+            params = {
+                "function": "OVERVIEW",
+                "symbol": symbol,
+                "apikey": self.av_api_key
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.av_base_url, params=params, timeout=10) as response:
+                    data = await response.json()
+                    self.av_calls += 1
+                    
+                    if data and "Symbol" in data:
+                        self.av_success += 1
+                        self.av_limiter.record_success()
+                        result = {
+                            "symbol": data.get("Symbol"),
+                            "company_name": data.get("Name"),
+                            "sector": data.get("Sector"),
+                            "industry": data.get("Industry"),
+                            "market_cap": float(data.get("MarketCapitalization", 0)),
+                            "pe_ratio": float(data.get("PERatio", 0)),
+                            "pb_ratio": float(data.get("PriceToBookRatio", 0)),
+                            "roe": float(data.get("ReturnOnEquityTTM", "0").replace("%", "")),
+                            "roa": float(data.get("ReturnOnAssetsTTM", "0").replace("%", "")),
+                            "dividend_yield": float(data.get("DividendYield", "0").replace("%", "")),
+                            "eps": float(data.get("EPS", 0)),
+                        }
+                        if data.get("DebtToEquity") not in (None, "None", "-", ""):
+                            result["debt_to_equity"] = float(data["DebtToEquity"])
+                        if data.get("QuarterlyRevenueGrowthYOY") not in (None, "None", "-", ""):
+                            result["revenue_growth"] = float(data["QuarterlyRevenueGrowthYOY"]) * 100
+                        return result
+                    self.av_limiter.record_failure()
+        except Exception as e:
+            self.av_limiter.record_failure()
+            logger.warning(f"Alpha Vantage company info error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    
+    # ========================================================================
+    # FINNHUB METHODS (Priority 3 - Fastest real-time fallback)
     # ========================================================================
     
     def _can_call_fh(self) -> bool:
@@ -118,7 +531,7 @@ class HybridDataEngine:
         self.fh_calls_minute.append(time.time())
     
     async def _fetch_fh_quote(self, symbol: str) -> Optional[Dict]:
-        """Fetch quote from Finnhub - FASTEST real-time data"""
+        """Fetch quote from Finnhub - Fastest real-time data"""
         if not self.fh_enabled or not self._can_call_fh():
             return None
         
@@ -147,21 +560,10 @@ class HybridDataEngine:
     
     async def _fetch_fh_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
         """Fetch historical from Finnhub"""
-        # Finnhub's free tier permanently returns 403 on /stock/candle
-        # (confirmed repeatedly in production logs) — it's a plan
-        # restriction, not a transient error, so retrying it on every
-        # single chart/quote request just wastes a network round-trip and
-        # fills the logs with noise. self.fh_historical_available starts
-        # True and flips to False the first time we see a 403 (below),
-        # so we stop trying for the rest of this process's lifetime
-        # without needing any manual configuration.
-        if not self.fh_historical_available:
-            return None
-        if not self.fh_enabled or not self._can_call_fh():
+        if not self.fh_historical_available or not self.fh_enabled or not self._can_call_fh():
             return None
         
         try:
-            # Map period to resolution
             end = datetime.now()
             if period == "1d":
                 start = end - timedelta(days=2)
@@ -212,17 +614,9 @@ class HybridDataEngine:
                     self.fh_success += 1
                     return result
         except Exception as e:
-            # A 403 here means the plan restriction, not a transient
-            # issue — stop retrying this for the rest of the process's
-            # lifetime instead of hitting it (and logging it) again on
-            # every future chart/historical request.
             if "403" in str(e):
-                if self.fh_historical_available:
-                    logger.warning(
-                        f"Finnhub historical returned 403 (plan restriction) — "
-                        f"disabling Finnhub historical for the rest of this session"
-                    )
                 self.fh_historical_available = False
+                logger.warning(f"Finnhub historical disabled (plan restriction)")
             logger.warning(f"Finnhub historical error for {symbol}: {type(e).__name__}: {e}")
         return None
     
@@ -233,11 +627,6 @@ class HybridDataEngine:
         
         try:
             loop = asyncio.get_event_loop()
-            # FIXED: company_profile2(**params) only accepts keyword
-            # arguments — passing symbol positionally (the old code) threw
-            # "takes 1 positional argument but 2 were given" on every
-            # single call, silently killing Finnhub's company info tier
-            # regardless of plan/API key validity.
             profile = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: self.fh_client.company_profile2(symbol=symbol)),
                 timeout=8
@@ -246,13 +635,6 @@ class HybridDataEngine:
             
             if profile:
                 self.fh_success += 1
-                # FIXED: Finnhub returns marketCapitalization in MILLIONS
-                # of the reporting currency (their documented convention),
-                # not raw dollars — unlike Alpha Vantage's
-                # MarketCapitalization field, which already is raw
-                # dollars. Storing it unconverted made every FH-sourced
-                # market cap display 1,000,000x too small (e.g. AAPL's
-                # true ~$4.6T showing as "$4.60M").
                 raw_market_cap = profile.get('marketCapitalization', 0)
                 return {
                     "company_name": profile.get('name'),
@@ -266,280 +648,11 @@ class HybridDataEngine:
         return None
     
     # ========================================================================
-    # ALPHA VANTAGE METHODS (Priority 2 - Best fundamentals)
-    # ========================================================================
-    
-    def _can_call_av(self) -> bool:
-        """Check Alpha Vantage rate limit (5/min, 500/day)"""
-        now = time.time()
-        self.av_calls_minute = [t for t in self.av_calls_minute if now - t < 60]
-        if len(self.av_calls_minute) >= 5:
-            return False
-        
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        if today > self.av_day_reset:
-            self.av_calls_day = []
-            self.av_day_reset = today
-        
-        self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
-        return len(self.av_calls_day) < 500
-    
-    def _record_av_call(self):
-        now = time.time()
-        self.av_calls += 1
-        self.av_calls_minute.append(now)
-        self.av_calls_day.append(now)
-    
-    async def _fetch_av_quote(self, symbol: str) -> Optional[Dict]:
-        """Fetch quote from Alpha Vantage"""
-        if not self.av_enabled or not self._can_call_av():
-            return None
-        
-        try:
-            params = {
-                "function": "GLOBAL_QUOTE",
-                "symbol": symbol,
-                "apikey": self.av_api_key
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.av_base_url, params=params, timeout=8) as response:
-                    data = await response.json()
-                    self._record_av_call()
-                    
-                    quote = data.get("Global Quote", {})
-                    if quote and quote.get("05. price"):
-                        price = float(quote.get("05. price", 0))
-                        if price > 0:
-                            self.av_success += 1
-                            return {
-                                "price": price,
-                                "change": round(float(quote.get("09. change", 0)), 2),
-                                "change_percent": float(quote.get("10. change percent", "0%").replace("%", "")),
-                                "volume": int(quote.get("06. volume", 0)),
-                                "previous_close": float(quote.get("08. previous close", price)),
-                                "open": float(quote.get("02. open", price)),
-                                "high": float(quote.get("03. high", price)),
-                                "low": float(quote.get("04. low", price)),
-                                "source": "Alpha Vantage",
-                                "latency": "slightly delayed"
-                            }
-                    # AV returns rate-limit/error messages as HTTP 200 with
-                    # a message field instead of an actual quote — these
-                    # were previously silent. Surface them.
-                    if any(k in data for k in ("Error Message", "Note", "Information")):
-                        logger.warning(f"Alpha Vantage quote rejected for {symbol}: {data}")
-        except Exception as e:
-            logger.warning(f"Alpha Vantage quote error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    async def _fetch_av_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
-        """Fetch historical from Alpha Vantage"""
-        if not self.av_enabled or not self._can_call_av():
-            return None
-        
-        output_size = "compact" if period in ["1d", "5d", "1mo"] else "full"
-        
-        try:
-            params = {
-                "function": "TIME_SERIES_DAILY",
-                "symbol": symbol,
-                "outputsize": output_size,
-                "apikey": self.av_api_key
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.av_base_url, params=params, timeout=12) as response:
-                    data = await response.json()
-                    self._record_av_call()
-                    
-                    if "Error Message" in data:
-                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {data.get('Error Message')}")
-                        return None
-                    if "Note" in data:
-                        logger.warning(f"Alpha Vantage historical rate-limited for {symbol}: {data.get('Note')}")
-                        return None
-                    if "Information" in data:
-                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {data.get('Information')}")
-                        return None
-                    
-                    time_series = data.get("Time Series (Daily)", {})
-                    if time_series:
-                        result = []
-                        for date, values in sorted(time_series.items(), reverse=True)[:100]:
-                            try:
-                                result.append({
-                                    "date": date,
-                                    "price": float(values.get("4. close", 0)),
-                                    "open": float(values.get("1. open", 0)),
-                                    "high": float(values.get("2. high", 0)),
-                                    "low": float(values.get("3. low", 0)),
-                                    "volume": int(values.get("5. volume", 0))
-                                })
-                            except:
-                                continue
-                        
-                        if result:
-                            self.av_success += 1
-                            return result
-        except Exception as e:
-            logger.warning(f"Alpha Vantage historical error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    async def _fetch_av_company_info(self, symbol: str) -> Optional[Dict]:
-        """Fetch company overview from Alpha Vantage (BEST FUNDAMENTALS)"""
-        if not self.av_enabled or not self._can_call_av():
-            return None
-        
-        try:
-            params = {
-                "function": "OVERVIEW",
-                "symbol": symbol,
-                "apikey": self.av_api_key
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.av_base_url, params=params, timeout=8) as response:
-                    data = await response.json()
-                    self._record_av_call()
-                    
-                    if data and "Symbol" in data:
-                        self.av_success += 1
-                        # NOTE: Alpha Vantage's OVERVIEW endpoint has no
-                        # "DebtToEquity" field at all — it never existed in
-                        # their schema. The old code did
-                        # data.get("DebtToEquity", 0), which silently faked
-                        # every single stock as debt-free (D/E = 0.00)
-                        # instead of correctly reporting "unavailable".
-                        # Also "RevenueGrowth" isn't a real AV field either;
-                        # the correct key is "QuarterlyRevenueGrowthYOY".
-                        result = {
-                            "symbol": data.get("Symbol"),
-                            "company_name": data.get("Name"),
-                            "sector": data.get("Sector"),
-                            "industry": data.get("Industry"),
-                            "market_cap": float(data.get("MarketCapitalization", 0)),
-                            "pe_ratio": float(data.get("PERatio", 0)),
-                            "pb_ratio": float(data.get("PriceToBookRatio", 0)),
-                            "roe": float(data.get("ReturnOnEquityTTM", "0").replace("%", "")),
-                            "roa": float(data.get("ReturnOnAssetsTTM", "0").replace("%", "")),
-                            "dividend_yield": float(data.get("DividendYield", "0").replace("%", "")),
-                            "eps": float(data.get("EPS", 0)),
-                        }
-                        # These two genuinely aren't in AV's schema — only
-                        # include them if a value is actually present,
-                        # so downstream correctly treats them as unknown
-                        # (N/A) rather than a fake confident zero.
-                        if data.get("DebtToEquity") not in (None, "None", "-", ""):
-                            result["debt_to_equity"] = float(data["DebtToEquity"])
-                        if data.get("QuarterlyRevenueGrowthYOY") not in (None, "None", "-", ""):
-                            result["revenue_growth"] = float(data["QuarterlyRevenueGrowthYOY"]) * 100
-                        return result
-        except Exception as e:
-            logger.warning(f"Alpha Vantage company info error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    # ========================================================================
-    # YFINANCE METHODS (Priority 3 - Ultimate fallback)
-    # ========================================================================
-    
-    async def _fetch_yf_quote(self, symbol: str) -> Optional[Dict]:
-        """Fetch quote from yFinance (fallback)"""
-        if yf_rate_limiter.is_blocked():
-            return None
-        try:
-            # FIXED: this call previously bypassed yf_rate_limiter entirely,
-            # so it could fire concurrently with other yfinance calls
-            # (historical, company info, chart endpoint) and trip Yahoo's
-            # anti-scraping throttling — causing intermittent failures that
-            # made the app fall back to fake demo data.
-            await yf_rate_limiter.acquire()
-            loop = asyncio.get_event_loop()
-            # FIXED: yfinance calls have no built-in timeout (unlike
-            # Finnhub's 10s and Alpha Vantage's aiohttp timeout=8/12).
-            # Wrapped in wait_for so a stalled connection can no longer
-            # hang the whole cascading-fallback chain past the frontend's
-            # 30s request timeout.
-            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
-            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
-            self.yf_calls += 1
-            
-            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-            if price:
-                self.yf_success += 1
-                yf_rate_limiter.record_success()
-                return {
-                    "price": float(price),
-                    "change": float(info.get('regularMarketChange', 0)),
-                    "change_percent": float(info.get('regularMarketChangePercent', 0)),
-                    "volume": int(info.get('volume', 0)),
-                    "previous_close": float(info.get('previousClose', price)),
-                    "open": float(info.get('open', price)),
-                    "high": float(info.get('dayHigh', price)),
-                    "low": float(info.get('dayLow', price)),
-                    "source": "yFinance",
-                    "latency": "delayed"
-                }
-        except Exception as e:
-            yf_rate_limiter.record_failure()
-            logger.warning(f"yFinance quote error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    async def _fetch_yf_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
-        """Fetch historical from yFinance (fallback)"""
-        if yf_rate_limiter.is_blocked():
-            return None
-        try:
-            await yf_rate_limiter.acquire()
-            loop = asyncio.get_event_loop()
-            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
-            hist = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: stock.history(period=period, interval=interval)),
-                timeout=10
-            )
-            self.yf_calls += 1
-            
-            if hist is not None and not hist.empty:
-                self.yf_success += 1
-                yf_rate_limiter.record_success()
-                result = []
-                for date, row in hist.iterrows():
-                    result.append({
-                        "date": date.isoformat(),
-                        "price": round(float(row['Close']), 2),
-                        "open": round(float(row['Open']), 2),
-                        "high": round(float(row['High']), 2),
-                        "low": round(float(row['Low']), 2),
-                        "volume": int(row['Volume']) if 'Volume' in row else 0
-                    })
-                return result
-        except Exception as e:
-            yf_rate_limiter.record_failure()
-            logger.warning(f"yFinance historical error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
-        """Fetch company info from yFinance (fallback)"""
-        try:
-            await yf_rate_limiter.acquire()
-            loop = asyncio.get_event_loop()
-            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
-            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
-            self.yf_calls += 1
-            
-            if info:
-                self.yf_success += 1
-                return info
-        except Exception as e:
-            logger.warning(f"yFinance company info error for {symbol}: {type(e).__name__}: {e}")
-        return None
-    
-    # ========================================================================
-    # PUBLIC METHODS WITH CASCADING FALLBACK
+    # PUBLIC METHODS WITH CASCADING FALLBACK (yFinance Priority)
     # ========================================================================
     
     async def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get real-time quote with cascading fallback"""
+        """Get real-time quote with cascading fallback (yFinance first)"""
         
         cache_key = f"quote:{symbol}"
         if cache_key in self.cache:
@@ -547,8 +660,8 @@ class HybridDataEngine:
             if time.time() - ts < self.quote_cache_ttl:
                 return cached
         
-        # Priority 1: Finnhub (Fastest real-time)
-        result = await self._fetch_fh_quote(symbol)
+        # Priority 1: yFinance (Most reliable)
+        result = await self._fetch_yf_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
@@ -559,8 +672,8 @@ class HybridDataEngine:
             self.cache[cache_key] = (result, time.time())
             return result
         
-        # Priority 3: yFinance (Ultimate fallback)
-        result = await self._fetch_yf_quote(symbol)
+        # Priority 3: Finnhub (Fastest fallback)
+        result = await self._fetch_fh_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
@@ -568,7 +681,7 @@ class HybridDataEngine:
         return None
     
     async def get_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
-        """Get historical data with cascading fallback"""
+        """Get historical data with cascading fallback (yFinance first)"""
         
         cache_key = f"hist:{symbol}:{period}:{interval}"
         if cache_key in self.cache:
@@ -576,8 +689,8 @@ class HybridDataEngine:
             if time.time() - ts < self.historical_cache_ttl:
                 return cached
         
-        # Priority 1: Finnhub (Fastest)
-        result = await self._fetch_fh_historical(symbol, period)
+        # Priority 1: yFinance (Most reliable)
+        result = await self._fetch_yf_historical(symbol, period, interval)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
@@ -588,8 +701,8 @@ class HybridDataEngine:
             self.cache[cache_key] = (result, time.time())
             return result
         
-        # Priority 3: yFinance (Ultimate fallback)
-        result = await self._fetch_yf_historical(symbol, period, interval)
+        # Priority 3: Finnhub (Fastest)
+        result = await self._fetch_fh_historical(symbol, period)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
@@ -597,33 +710,22 @@ class HybridDataEngine:
         return None
     
     async def get_company_info(self, symbol: str) -> Optional[Dict]:
-        """Get company fundamentals with cascading fallback.
-
-        NOTE: Alpha Vantage and Finnhub return snake_case field names
-        (pe_ratio, market_cap, roe...), but everything downstream
-        (financials.py's calculators, build_stock_response) expects
-        yfinance's native camelCase schema (trailingPE, marketCap,
-        returnOnEquity...). Results from those two tiers are normalized
-        to that schema here — at the source — so every caller gets a
-        consistent shape regardless of which tier actually served the
-        data. yFinance's own result is already in the right schema and
-        is returned unchanged.
-        """
-
-        # Priority 1: Alpha Vantage (BEST fundamentals)
+        """Get company fundamentals with cascading fallback (yFinance first)"""
+        
+        # Priority 1: yFinance (Most comprehensive and reliable)
+        result = await self._fetch_yf_company_info(symbol)
+        if result:
+            return result
+        
+        # Priority 2: Alpha Vantage (Best fundamentals)
         result = await self._fetch_av_company_info(symbol)
         if result:
             return _map_av_fh_company_info_to_yf_schema(result)
         
-        # Priority 2: Finnhub (Good fundamentals)
+        # Priority 3: Finnhub (Good fundamentals)
         result = await self._fetch_fh_company_info(symbol)
         if result:
             return _map_av_fh_company_info_to_yf_schema(result)
-        
-        # Priority 3: yFinance (Fallback) — already yfinance-native schema
-        result = await self._fetch_yf_company_info(symbol)
-        if result:
-            return result
         
         return None
     
@@ -632,19 +734,7 @@ class HybridDataEngine:
         results = []
         for symbol in symbols:
             try:
-                # Try Finnhub first
-                quote = await self._fetch_fh_quote(symbol)
-                if quote:
-                    results.append({
-                        "symbol": symbol,
-                        "name": self._get_index_name(symbol),
-                        "value": quote.get("price", 0),
-                        "change": quote.get("change_percent", 0),
-                        "source": "Finnhub"
-                    })
-                    continue
-                
-                # Try yFinance for indices
+                # Try yFinance first
                 quote = await self._fetch_yf_quote(symbol)
                 if quote:
                     results.append({
@@ -653,6 +743,18 @@ class HybridDataEngine:
                         "value": quote.get("price", 0),
                         "change": quote.get("change_percent", 0),
                         "source": "yFinance"
+                    })
+                    continue
+                
+                # Try Finnhub as fallback
+                quote = await self._fetch_fh_quote(symbol)
+                if quote:
+                    results.append({
+                        "symbol": symbol,
+                        "name": self._get_index_name(symbol),
+                        "value": quote.get("price", 0),
+                        "change": quote.get("change_percent", 0),
+                        "source": "Finnhub"
                     })
             except Exception as e:
                 logger.warning(f"Failed to fetch index {symbol}: {e}")
@@ -678,68 +780,27 @@ class HybridDataEngine:
         """Get engine statistics"""
         now = time.time()
         return {
+            "yfinance": {
+                "enabled": True,
+                **self.yf_limiter.get_stats(),
+                "calls": self.yf_calls,
+                "success": self.yf_success
+            },
+            "alpha_vantage": {
+                "enabled": self.av_enabled,
+                **self.av_limiter.get_stats(),
+                "calls": self.av_calls,
+                "success": self.av_success
+            },
             "finnhub": {
                 "enabled": self.fh_enabled,
                 "calls": self.fh_calls,
                 "success": self.fh_success,
                 "rate_limit": len([t for t in self.fh_calls_minute if now - t < 60])
             },
-            "alpha_vantage": {
-                "enabled": self.av_enabled,
-                "calls": self.av_calls,
-                "success": self.av_success,
-                "rate_limit": len([t for t in self.av_calls_minute if now - t < 60])
-            },
-            "yfinance": {
-                "enabled": True,
-                "calls": self.yf_calls,
-                "success": self.yf_success
-            },
             "cache_size": len(self.cache)
         }
 
-
-# ============= RATE LIMITER =============
-class YFinanceRateLimiter:
-    def __init__(self, max_calls_per_minute=25):
-        self.calls = []
-        self.max_calls = max_calls_per_minute
-        self.lock = asyncio.Lock()
-        # Circuit breaker: when Yahoo is actively rate-limiting/blocking us
-        # (common on cloud hosts like Render), repeatedly retrying every
-        # ~60s per symbol just wastes calls and floods the logs without
-        # ever succeeding. After enough consecutive failures, stop calling
-        # yfinance entirely for a cooldown window.
-        self.consecutive_failures = 0
-        self.failure_threshold = 5
-        self.cooldown_seconds = 300  # 5 minutes
-        self.blocked_until = 0
-
-    def is_blocked(self) -> bool:
-        return time.time() < self.blocked_until
-
-    def record_success(self):
-        self.consecutive_failures = 0
-        self.blocked_until = 0
-
-    def record_failure(self):
-        self.consecutive_failures += 1
-        if self.consecutive_failures >= self.failure_threshold:
-            self.blocked_until = time.time() + self.cooldown_seconds
-            logger.warning(
-                f"yFinance circuit breaker OPEN after {self.consecutive_failures} "
-                f"consecutive failures — skipping yFinance calls for {self.cooldown_seconds}s"
-            )
-
-    async def acquire(self):
-        async with self.lock:
-            now = time.time()
-            self.calls = [t for t in self.calls if now - t < 60]
-            if len(self.calls) >= self.max_calls:
-                wait_time = 60 - (now - self.calls[0]) + 0.5
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-            self.calls.append(time.time())
 
 # Initialize Hybrid Engine
 hybrid_engine = HybridDataEngine()
@@ -860,15 +921,8 @@ class LRUCache:
 
 stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
 chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
-# Long-lived cache of the last successfully fetched REAL data per symbol
-# (6 hour TTL). Checked before ever falling back to the hardcoded demo
-# dataset, so a transient yfinance/Finnhub/AlphaVantage hiccup shows a
-# slightly stale REAL price instead of swapping to a fake one — this is
-# what was causing prices to visibly "jump" between the real quote and
-# the hardcoded fallback number.
 last_good_stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
 last_good_chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
-yf_rate_limiter = YFinanceRateLimiter(max_calls_per_minute=25)
 
 request_counts = defaultdict(list)
 
@@ -976,16 +1030,7 @@ async def _fetch_indices_internal() -> list:
     return await hybrid_engine.get_indices(indices_config)
 
 async def market_updater():
-    """Periodically refresh market indices and push to WebSocket subscribers.
-
-    FIXED: this was refetching all 10 index symbols via yFinance every 60
-    seconds — 600 calls/hour just for the ticker tape, which was the
-    single biggest driver of Yahoo's rate limiting on Render's shared IP
-    (the circuit breaker was tripping within 1 second of every restart,
-    before any real user request even happened). Indices don't need
-    per-minute freshness for this app; 5 minutes is a much safer rate
-    while still feeling "live" to users.
-    """
+    """Periodically refresh market indices and push to WebSocket subscribers"""
     while True:
         try:
             stock_cache.delete_pattern("market:indices")
@@ -1019,14 +1064,12 @@ async def price_updater():
                         if backoff_times[symbol] > time.time():
                             continue
                         try:
-                            # Use hybrid engine for quote (fast)
                             quote = await hybrid_engine.get_quote(symbol)
                             
                             if quote and quote.get('price'):
                                 current_price = quote['price']
                                 change = quote.get('change_percent', 0)
                                 
-                                # Check if price changed significantly
                                 last_price = last_prices.get(symbol, current_price)
                                 if abs(current_price - last_price) > 0.05 or abs(change) > 0.5:
                                     await manager.broadcast_to_symbol(symbol, {
@@ -1047,9 +1090,8 @@ async def price_updater():
                         except Exception as e:
                             logger.debug(f"Price update error for {symbol}: {e}")
                             consecutive_failures[symbol] += 1
-                    await asyncio.sleep(0.5)  # Faster updates
-            update_interval = 5  # Faster updates
-            await asyncio.sleep(update_interval)
+                    await asyncio.sleep(0.5)
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Error in price updater: {e}")
             await asyncio.sleep(5)
@@ -1058,7 +1100,7 @@ async def price_updater():
 async def startup_event():
     asyncio.create_task(market_updater())
     asyncio.create_task(price_updater())
-    logger.info("Background tasks started with Optimized Hybrid Engine")
+    logger.info("Background tasks started with Optimized Hybrid Engine (yFinance priority)")
 
 # ============= HELPER FUNCTIONS =============
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -1137,22 +1179,7 @@ def get_fallback_stock_data(symbol: str) -> Dict:
     }
 
 def _map_av_fh_company_info_to_yf_schema(company_info: Dict) -> Dict:
-    """
-    Translate Alpha Vantage / Finnhub's company_info output (snake_case:
-    pe_ratio, market_cap, roe, debt_to_equity...) into yfinance's native
-    camelCase schema (trailingPE, marketCap, returnOnEquity,
-    debtToEquity...), which is what financials.py's calculate_pe_ratio /
-    calculate_pb_ratio / calculate_roe / etc. and build_stock_response
-    actually read.
-
-    BUG THIS FIXES: company_info used to be merged directly, so a
-    successful Alpha Vantage or Finnhub fetch silently produced
-    Market Cap / P/E / P/B / EPS / ROE / D-E = N/A across the board (key
-    names never matched what the calculators looked for), even though
-    the real data had arrived. yFinance's own company info is already in
-    this schema and must NOT be passed through this mapper (it uses
-    different, snake_case-free key names already) — see get_company_info().
-    """
+    """Translate Alpha Vantage / Finnhub output to yFinance schema"""
     if not company_info:
         return {}
 
@@ -1186,7 +1213,7 @@ def _map_av_fh_company_info_to_yf_schema(company_info: Dict) -> Dict:
     return mapped
 
 async def fetch_stock_data(symbol: str, use_cache: bool = True):
-    """Fetch stock data using hybrid engine with fallback"""
+    """Fetch stock data using hybrid engine with yFinance priority"""
     cache_key = f"stock_data:{symbol}"
     if use_cache:
         cached = stock_cache.get(cache_key)
@@ -1198,16 +1225,15 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
         symbol_map = {"NVD": "NVDA", "BRK.B": "BRK-B", "BF.B": "BF-B"}
         symbol = symbol_map.get(symbol, symbol)
 
-        # Use hybrid engine for quote (fastest available)
+        # Use hybrid engine for quote (yFinance priority)
         quote = await hybrid_engine.get_quote(symbol)
         
-        # Use hybrid engine for historical
+        # Use hybrid engine for historical (yFinance priority)
         hist_data = await hybrid_engine.get_historical(symbol, "1mo")
         
-        # Get company info (priority: Alpha Vantage → Finnhub → yFinance)
+        # Get company info (yFinance priority)
         company_info = await hybrid_engine.get_company_info(symbol)
         
-        # If we have quote data, convert to yFinance-like format
         if quote:
             class MockStock:
                 def __init__(self, info_dict):
@@ -1226,21 +1252,10 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 "open": quote.get("open", 0),
             }
             
-            # Add company info if available
             if company_info:
                 info.update(company_info)
             
             stock = MockStock(info)
-            
-            # Convert historical data to DataFrame
-            # FIXED: pandas was only imported inside the `if hist_data:`
-            # branch — when hist_data was falsy (increasingly common now
-            # that Finnhub/AV fail more often), the `else` branch tried to
-            # use `pd` on a code path where it had never been bound,
-            # raising "cannot access local variable 'pd'" and crashing
-            # the entire request instead of gracefully falling through to
-            # cached/fallback data as intended.
-            import pandas as pd
             if hist_data:
                 df_data = []
                 for item in hist_data:
@@ -1261,16 +1276,12 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 stock_cache.set(cache_key, result)
             return result
 
-        # Ultimate fallback to yFinance (timeout-bounded — see hybrid
-        # engine's _fetch_yf_* methods for why this matters: an unbounded
-        # yfinance call here could hang the whole /api/stock/{symbol}
-        # request well past the frontend's 30s timeout)
-        await yf_rate_limiter.acquire()
-        loop = asyncio.get_event_loop()
+        # Ultimate fallback: direct yFinance call
         try:
-            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
-            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
-            hist = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.history(period="1mo")), timeout=10)
+            loop = asyncio.get_event_loop()
+            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=10)
+            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=10)
+            hist = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.history(period="1mo")), timeout=15)
         except asyncio.TimeoutError:
             logger.warning(f"yFinance ultimate fallback timed out for {symbol}")
             return None, {}, None
@@ -1435,13 +1446,9 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
             response_data = build_stock_response(symbol, stock, info, hist)
             if use_cache:
                 stock_cache.set(cache_key, response_data)
-            # Remember this as the last known-good REAL data for this symbol
             last_good_stock_cache.set(symbol, response_data)
             return response_data
 
-        # Live sources failed this round — prefer the last successfully
-        # fetched REAL data (even if a bit stale) over the hardcoded demo
-        # dataset, so the price doesn't visibly jump to a fake number.
         last_good = last_good_stock_cache.get(symbol)
         if last_good:
             logger.warning(f"Live fetch failed for {symbol} — serving last known-good real data")
@@ -1477,7 +1484,6 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             if cached:
                 return cached
 
-        # Use hybrid engine for historical data (fast)
         interval = "1d" if period in {"1mo", "3mo", "6mo", "1y"} else "1h"
         try:
             hist_data = await hybrid_engine.get_historical(symbol, period, interval)
@@ -1490,45 +1496,11 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
             last_good_chart_cache.set(cache_key, hist_data)
             return hist_data
 
-        # NOTE: previously there was a second, redundant yfinance fallback
-        # attempt here — but hybrid_engine.get_historical() above already
-        # tries Finnhub → Alpha Vantage → yFinance internally (each leg
-        # now timeout-bounded). Calling yfinance a second time just added
-        # a duplicate unbounded network round-trip on top of the three the
-        # hybrid engine already made, which was the main reason chart
-        # requests could exceed the frontend's 30s timeout. Removed.
-
-        # Prefer the last successfully fetched REAL chart data (even if a
-        # bit stale) over randomly generated synthetic data — otherwise a
-        # transient failure makes the price history visibly jump between
-        # real and fake data on refresh.
         last_good = last_good_chart_cache.get(cache_key)
         if last_good:
             logger.warning(f"Live chart fetch failed for {symbol} — serving last known-good real chart data")
             return last_good
 
-        # Synthetic fallback data (only reached when we've never
-        # successfully fetched real chart data for this symbol/period).
-        # FIXED: this used to seed the random walk from
-        # get_fallback_stock_data()'s hardcoded demo price (~$175 for
-        # AAPL) unconditionally — even when a REAL current price was
-        # already known from a successful quote elsewhere (e.g. the main
-        # /api/stock/{symbol} response). That produced a chart showing a
-        # completely different price level than the real quote on the
-        # same page (e.g. chart around $175 while the header showed
-        # $316).
-        #
-        # FIXED (round 2): checking last_good_stock_cache alone isn't
-        # enough — the frontend fires the chart request and the main
-        # stock-analysis request in PARALLEL (intentionally, for speed),
-        # so on a cold cache the chart request frequently finishes first,
-        # before /api/stock/{symbol} has had a chance to populate
-        # last_good_stock_cache with the real price at all. That race
-        # meant this "fix" often silently did nothing. Now, if the cache
-        # is empty, we fetch a live quote directly as a last resort
-        # before falling to the fully-synthetic demo price — quote calls
-        # are cheap/fast (a single lightweight request, not historical),
-        # so this rarely fails even when historical data is unavailable.
         logger.info(f"Using synthetic chart data for {symbol} ({period}) — live sources unavailable")
         base_price = None
         real_last_known = last_good_stock_cache.get(symbol)
@@ -1803,28 +1775,28 @@ async def debug_stock(symbol: str):
             "tests": []
         }
         
-        # Test hybrid engine quote
+        # Test yFinance quote
         quote = await hybrid_engine.get_quote(symbol)
         result["tests"].append({
-            "name": "hybrid_quote",
+            "name": "yfinance_quote",
             "success": bool(quote and quote.get('price')),
             "data": quote
         })
         
-        # Test hybrid engine historical
+        # Test yFinance historical
         hist = await hybrid_engine.get_historical(symbol, "1mo")
         result["tests"].append({
-            "name": "hybrid_historical",
+            "name": "yfinance_historical",
             "success": bool(hist and len(hist) > 0),
             "count": len(hist) if hist else 0
         })
         
-        # Test hybrid engine company info
+        # Test yFinance company info
         info = await hybrid_engine.get_company_info(symbol)
         result["tests"].append({
-            "name": "hybrid_company",
+            "name": "yfinance_company",
             "success": bool(info),
-            "company": info.get('company_name') if info else None
+            "company": info.get('company_name', info.get('longName')) if info else None
         })
         
         return result
