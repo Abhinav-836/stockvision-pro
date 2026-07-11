@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import yfinance as yf
 import numpy as np
+import pandas as pd
 import asyncio
 import logging
 from collections import OrderedDict, defaultdict
@@ -76,6 +77,10 @@ class HybridDataEngine:
         # of this process's lifetime; quote/company-profile calls are
         # unaffected and keep working normally on the free tier.
         self.fh_historical_available = True
+        # Last real value seen per index symbol, used when Finnhub can't
+        # cover a symbol instead of burning yFinance's shared rate-limit
+        # budget on something that reliably fails anyway.
+        self._last_good_indices: Dict[str, Dict] = {}
 
         # Alpha Vantage (Priority 2 - Best fundamentals)
         self.av_api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -628,36 +633,87 @@ class HybridDataEngine:
         return None
     
     async def get_indices(self, symbols: List[str]) -> List[Dict]:
-        """Get market indices data"""
+        """Get market indices data.
+
+        FIXED: this used to fall through to yFinance via the SAME shared
+        circuit breaker used for stock quotes/historical/company info.
+        Finnhub's free tier doesn't recognize these index symbols
+        (^GSPC, ^VIX, BTC-USD, etc.) at all, so every single index was
+        hitting yFinance every cycle — tripping the shared breaker before
+        any real stock lookup even happened, which then blocked yFinance
+        for company fundamentals too (the one place we actually need it,
+        since only yFinance's .info has P/E, P/B, ROE, etc. in full).
+        Indices now go through their own ISOLATED rate limiter
+        (yf_indices_rate_limiter) — they can still get real yFinance data
+        when it's available, but their failures can never again block
+        fundamentals from getting their own shot at yFinance.
+        """
         results = []
         for symbol in symbols:
             try:
-                # Try Finnhub first
                 quote = await self._fetch_fh_quote(symbol)
                 if quote:
-                    results.append({
+                    result = {
                         "symbol": symbol,
                         "name": self._get_index_name(symbol),
                         "value": quote.get("price", 0),
                         "change": quote.get("change_percent", 0),
                         "source": "Finnhub"
-                    })
+                    }
+                    self._last_good_indices[symbol] = result
+                    results.append(result)
                     continue
-                
-                # Try yFinance for indices
-                quote = await self._fetch_yf_quote(symbol)
+
+                quote = await self._fetch_yf_index_quote(symbol)
                 if quote:
-                    results.append({
+                    result = {
                         "symbol": symbol,
                         "name": self._get_index_name(symbol),
                         "value": quote.get("price", 0),
                         "change": quote.get("change_percent", 0),
                         "source": "yFinance"
-                    })
+                    }
+                    self._last_good_indices[symbol] = result
+                    results.append(result)
+                elif symbol in self._last_good_indices:
+                    stale = dict(self._last_good_indices[symbol])
+                    stale["is_stale"] = True
+                    results.append(stale)
             except Exception as e:
                 logger.warning(f"Failed to fetch index {symbol}: {e}")
+                if symbol in self._last_good_indices:
+                    stale = dict(self._last_good_indices[symbol])
+                    stale["is_stale"] = True
+                    results.append(stale)
         
         return results
+
+    async def _fetch_yf_index_quote(self, symbol: str) -> Optional[Dict]:
+        """yFinance quote fetch for indices only — uses its own isolated
+        rate limiter/circuit breaker (yf_indices_rate_limiter), separate
+        from the one stock quotes/historical/company-info depend on. See
+        get_indices() docstring for why this separation matters."""
+        if yf_indices_rate_limiter.is_blocked():
+            return None
+        try:
+            await yf_indices_rate_limiter.acquire()
+            loop = asyncio.get_event_loop()
+            stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
+            info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
+            self.yf_calls += 1
+            price = info.get('regularMarketPrice') or info.get('currentPrice')
+            if price:
+                self.yf_success += 1
+                yf_indices_rate_limiter.record_success()
+                prev_close = info.get('regularMarketPreviousClose') or info.get('previousClose') or price
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+                return {"price": float(price), "change_percent": round(change_pct, 2)}
+            yf_indices_rate_limiter.record_failure()
+            return None
+        except Exception as e:
+            yf_indices_rate_limiter.record_failure()
+            logger.warning(f"yFinance index quote error for {symbol}: {type(e).__name__}: {e}")
+            return None
     
     def _get_index_name(self, symbol: str) -> str:
         names = {
@@ -869,6 +925,12 @@ chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=config.CACHE_TTL)
 last_good_stock_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
 last_good_chart_cache = LRUCache(max_size=config.MAX_CACHE_SIZE, ttl=21600)
 yf_rate_limiter = YFinanceRateLimiter(max_calls_per_minute=25)
+# Isolated from yf_rate_limiter on purpose — see get_indices() docstring.
+# Indices fail against yFinance far more often than real stock lookups
+# (Finnhub's free tier doesn't cover index symbols at all), and letting
+# that trip the SAME breaker used for company fundamentals was starving
+# fundamentals of yFinance access before they ever got a chance to use it.
+yf_indices_rate_limiter = YFinanceRateLimiter(max_calls_per_minute=15)
 
 request_counts = defaultdict(list)
 
@@ -1240,7 +1302,6 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             # raising "cannot access local variable 'pd'" and crashing
             # the entire request instead of gracefully falling through to
             # cached/fallback data as intended.
-            import pandas as pd
             if hist_data:
                 df_data = []
                 for item in hist_data:
