@@ -602,7 +602,8 @@ class HybridDataEngine:
         return None
     
     async def get_company_info(self, symbol: str) -> Optional[Dict]:
-        """Get company fundamentals with cascading fallback.
+        """Get company fundamentals, merging across tiers rather than
+        stopping at the first success.
 
         NOTE: Alpha Vantage and Finnhub return snake_case field names
         (pe_ratio, market_cap, roe...), but everything downstream
@@ -611,26 +612,53 @@ class HybridDataEngine:
         returnOnEquity...). Results from those two tiers are normalized
         to that schema here — at the source — so every caller gets a
         consistent shape regardless of which tier actually served the
-        data. yFinance's own result is already in the right schema and
-        is returned unchanged.
-        """
+        data. yFinance's own result is already in the right schema.
 
-        # Priority 1: Alpha Vantage (BEST fundamentals)
-        result = await self._fetch_av_company_info(symbol)
-        if result:
-            return _map_av_fh_company_info_to_yf_schema(result)
-        
-        # Priority 2: Finnhub (Good fundamentals)
-        result = await self._fetch_fh_company_info(symbol)
-        if result:
-            return _map_av_fh_company_info_to_yf_schema(result)
-        
-        # Priority 3: yFinance (Fallback) — already yfinance-native schema
-        result = await self._fetch_yf_company_info(symbol)
-        if result:
-            return result
-        
-        return None
+        FIXED: this used to return as soon as ANY tier gave a non-empty
+        result — but Finnhub's company_profile2 ALWAYS succeeds with only
+        company_name/sector/market_cap/exchange/country and structurally
+        never has P/E, P/B, ROE, EPS, D/E, average volume, or 52-week
+        range at all. That "partial success" was permanently blocking
+        yFinance — the only tier that actually has those fields — from
+        ever being tried. Now every enabled tier is asked to fill in
+        whatever's still missing, in priority order (Alpha Vantage's
+        numbers win when available since they're generally the most
+        accurate; Finnhub fills identity fields; yFinance fills whatever
+        is still gap after both).
+        """
+        merged: Dict = {}
+        key_fields = (
+            "trailingPE", "priceToBook", "returnOnEquity", "trailingEps",
+            "debtToEquity", "averageVolume", "fiftyTwoWeekHigh", "fiftyTwoWeekLow"
+        )
+
+        def still_missing() -> bool:
+            return not all(merged.get(k) is not None for k in key_fields)
+
+        # Priority 1: Alpha Vantage (best fundamentals when it's not rate-limited)
+        av_result = await self._fetch_av_company_info(symbol)
+        if av_result:
+            for k, v in _map_av_fh_company_info_to_yf_schema(av_result).items():
+                merged.setdefault(k, v)
+
+        # Priority 2: Finnhub (sector/market cap/exchange — never has
+        # valuation ratios, but still worth asking for what it does have)
+        if still_missing() or not merged:
+            fh_result = await self._fetch_fh_company_info(symbol)
+            if fh_result:
+                for k, v in _map_av_fh_company_info_to_yf_schema(fh_result).items():
+                    merged.setdefault(k, v)
+
+        # Priority 3: yFinance — the only tier with the full set of
+        # valuation ratios. Called whenever anything is still missing,
+        # not only when the first two tiers returned nothing at all.
+        if still_missing() or not merged:
+            yf_result = await self._fetch_yf_company_info(symbol)
+            if yf_result:
+                for k, v in yf_result.items():
+                    merged.setdefault(k, v)
+
+        return merged if merged else None
     
     async def get_indices(self, symbols: List[str]) -> List[Dict]:
         """Get market indices data.
