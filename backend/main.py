@@ -8,7 +8,6 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import yfinance as yf
 import numpy as np
-import pandas as pd
 import asyncio
 import logging
 from collections import OrderedDict, defaultdict
@@ -81,6 +80,10 @@ class HybridDataEngine:
         # cover a symbol instead of burning yFinance's shared rate-limit
         # budget on something that reliably fails anyway.
         self._last_good_indices: Dict[str, Dict] = {}
+        # Tracks in-flight get_historical() calls so concurrent identical
+        # requests (see get_historical() docstring) share one fetch
+        # instead of each independently burning API quota.
+        self._inflight_historical: Dict[str, asyncio.Task] = {}
 
         # Alpha Vantage (Priority 2 - Best fundamentals)
         self.av_api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -544,7 +547,18 @@ class HybridDataEngine:
     # ========================================================================
     
     async def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get real-time quote with cascading fallback"""
+        """Get real-time quote with cascading fallback.
+
+        FIXED: Alpha Vantage's free tier is a strict 25 requests/day — a
+        genuinely scarce resource. It used to be tried here for every
+        single quote, even though Finnhub already handles quotes
+        reliably on its own. Every AV call spent on a quote Finnhub could
+        already serve is one less call available for company fundamentals
+        (P/E, P/B, ROE, EPS, D/E...), which is the one thing AV provides
+        that neither Finnhub nor a rate-limited yFinance reliably can.
+        AV is no longer used for quotes — see get_company_info() for
+        where its scarce budget is now reserved.
+        """
         
         cache_key = f"quote:{symbol}"
         if cache_key in self.cache:
@@ -558,13 +572,7 @@ class HybridDataEngine:
             self.cache[cache_key] = (result, time.time())
             return result
         
-        # Priority 2: Alpha Vantage (Good backup)
-        result = await self._fetch_av_quote(symbol)
-        if result:
-            self.cache[cache_key] = (result, time.time())
-            return result
-        
-        # Priority 3: yFinance (Ultimate fallback)
+        # Priority 2: yFinance (fallback if Finnhub is down/plan-limited)
         result = await self._fetch_yf_quote(symbol)
         if result:
             self.cache[cache_key] = (result, time.time())
@@ -573,14 +581,38 @@ class HybridDataEngine:
         return None
     
     async def get_historical(self, symbol: str, period: str = "1mo", interval: str = "1d") -> Optional[List[Dict]]:
-        """Get historical data with cascading fallback"""
+        """Get historical data with cascading fallback.
+
+        FIXED: the frontend fires the chart request and the main
+        stock-analysis request in parallel (intentional, for speed), and
+        both end up calling this with the same symbol/period/interval at
+        nearly the same instant — before either one has finished and
+        populated self.cache. That meant BOTH independently burned a
+        separate Alpha Vantage call for identical data (confirmed in
+        production logs: two "Alpha Vantage historical rejected"
+        messages, 300ms apart, for the same symbol in the same page
+        load) — needlessly doubling the burn rate against AV's strict
+        25/day quota. Concurrent identical requests now share one
+        in-flight fetch instead of each starting their own.
+        """
         
         cache_key = f"hist:{symbol}:{period}:{interval}"
         if cache_key in self.cache:
             cached, ts = self.cache[cache_key]
             if time.time() - ts < self.historical_cache_ttl:
                 return cached
-        
+
+        if cache_key in self._inflight_historical:
+            return await self._inflight_historical[cache_key]
+
+        task = asyncio.ensure_future(self._fetch_historical_uncached(symbol, period, interval, cache_key))
+        self._inflight_historical[cache_key] = task
+        try:
+            return await task
+        finally:
+            self._inflight_historical.pop(cache_key, None)
+
+    async def _fetch_historical_uncached(self, symbol: str, period: str, interval: str, cache_key: str) -> Optional[List[Dict]]:
         # Priority 1: Finnhub (Fastest)
         result = await self._fetch_fh_historical(symbol, period)
         if result:
@@ -1330,6 +1362,7 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             # raising "cannot access local variable 'pd'" and crashing
             # the entire request instead of gracefully falling through to
             # cached/fallback data as intended.
+            import pandas as pd
             if hist_data:
                 df_data = []
                 for item in hist_data:
