@@ -33,6 +33,29 @@ try:
 except Exception:
     pass
 
+# Optional proxy for yFinance calls — set the YFINANCE_PROXY_URL env var to
+# route yfinance's requests through a proxy (a paid rotating proxy such as
+# ScraperAPI/Webshare/Bright Data, or a small proxy you run yourself on a
+# non-datacenter IP). This exists because Yahoo IP-blocks datacenter ranges
+# (Render, AWS, Railway, Heroku...) at the network level — no header or
+# retry change fixes that, only calling from a different IP does. Format:
+# "http://user:pass@host:port" (or "http://host:port" if your proxy has no
+# auth). Completely inert — yfinance behaves exactly as before — when the
+# env var is unset, so this is safe to deploy even before you have a proxy.
+YFINANCE_PROXY_URL = os.getenv("YFINANCE_PROXY_URL")
+if YFINANCE_PROXY_URL:
+    try:
+        yf.set_config(proxy=YFINANCE_PROXY_URL)
+        logger.info("yFinance configured to route through YFINANCE_PROXY_URL")
+    except AttributeError:
+        # Older yfinance builds don't have set_config(); upgrade yfinance
+        # (pip install -U yfinance) to use this env var.
+        logger.warning(
+            "Installed yfinance version has no yf.set_config() — "
+            "YFINANCE_PROXY_URL was set but is being ignored. "
+            "Upgrade yfinance to enable the proxy."
+        )
+
 # Import finnhub with fallback
 try:
     import finnhub
@@ -52,6 +75,196 @@ from financials import (
 )
 
 from ai_service import ai_service
+
+# ============= NSE DIRECT PROVIDER (Indian equities) =============
+
+class NSEDataProvider:
+    """
+    Direct client for NSE India's own public API (the same one
+    nseindia.com's website calls) — no API key needed.
+
+    WHY THIS EXISTS: Finnhub's free tier does not cover NSE/BSE symbols
+    at all, and Alpha Vantage's India coverage is unreliable. That left
+    yFinance as the ONLY data source anywhere in this app for Indian
+    stocks (.NS/.BO) — so when Yahoo's IP-reputation block hits a shared
+    host like Render, Indian stocks don't degrade to a slower tier, they
+    just stop working entirely. NSE's endpoint is a completely different
+    host than Yahoo, so a Yahoo-side block has zero effect on it.
+
+    NSE has its own bot defenses — it 401s any request that doesn't look
+    like it came from a real browser session — so every call here goes
+    through a cookie-bootstrapped session with browser-like headers
+    instead of a bare GET. NSE's free API only has price/trade data and a
+    few identity fields, NOT valuation ratios (P/E aside), so this is
+    layered in ahead of Finnhub/Alpha Vantage/yFinance for quotes and
+    historical prices, but company_info still falls through to the other
+    tiers for anything NSE doesn't have (ROE, debt-to-equity, EPS...).
+    """
+
+    BASE = "https://www.nseindia.com"
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._cookies_ts = 0.0
+        self._cookie_ttl = 240  # NSE's session cookies expire quickly
+        self._lock = asyncio.Lock()
+        self.calls = 0
+        self.success = 0
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(headers=self.HEADERS)
+        return self._session
+
+    async def _ensure_cookies(self):
+        """Visit the NSE homepage first to pick up session cookies — the
+        quote/historical endpoints 401 without them."""
+        if time.time() - self._cookies_ts < self._cookie_ttl:
+            return
+        async with self._lock:
+            if time.time() - self._cookies_ts < self._cookie_ttl:
+                return
+            session = await self._get_session()
+            try:
+                async with session.get(self.BASE, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    await resp.read()
+                self._cookies_ts = time.time()
+            except Exception as e:
+                logger.warning(f"NSE cookie bootstrap failed: {type(e).__name__}: {e}")
+
+    async def get_quote(self, symbol: str) -> Optional[Dict]:
+        """symbol WITHOUT the .NS/.BO suffix, e.g. 'RELIANCE'."""
+        try:
+            await self._ensure_cookies()
+            session = await self._get_session()
+            self.calls += 1
+            url = f"{self.BASE}/api/quote-equity?symbol={symbol}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            price_info = data.get("priceInfo", {}) or {}
+            last_price = price_info.get("lastPrice")
+            if last_price is None:
+                return None
+            prev_close = price_info.get("previousClose", last_price) or last_price
+            change = price_info.get("change")
+            pchange = price_info.get("pChange")
+            hi_lo = price_info.get("intraDayHighLow", {}) or {}
+            trade_info = (data.get("marketDeptOrderBook", {}) or {}).get("tradeInfo", {}) or {}
+
+            self.success += 1
+            return {
+                "price": float(last_price),
+                "change": float(change) if change is not None else round(last_price - prev_close, 2),
+                "change_percent": float(pchange) if pchange is not None else 0.0,
+                "volume": int(trade_info.get("totalTradedVolume", 0) or 0),
+                "previous_close": float(prev_close),
+                "open": float(price_info.get("open", last_price) or last_price),
+                "high": float(hi_lo.get("max", last_price) or last_price),
+                "low": float(hi_lo.get("min", last_price) or last_price),
+                "source": "NSE",
+                "latency": "delayed"
+            }
+        except Exception as e:
+            logger.warning(f"NSE quote error for {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    async def get_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
+        """NSE's historical endpoint wants an explicit date range rather
+        than a period string, so period is translated to a day count."""
+        days_map = {"1d": 3, "5d": 7, "1mo": 32, "3mo": 95, "6mo": 190,
+                    "1y": 370, "2y": 740, "5y": 1850}
+        days = days_map.get(period, 32)
+        end = datetime.now()
+        start = end - timedelta(days=days)
+        try:
+            await self._ensure_cookies()
+            session = await self._get_session()
+            self.calls += 1
+            url = (
+                f"{self.BASE}/api/historical/cm/equity?symbol={symbol}"
+                f"&series=[%22EQ%22]&from={start.strftime('%d-%m-%Y')}&to={end.strftime('%d-%m-%Y')}"
+            )
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            rows = data.get("data", [])
+            if not rows:
+                return None
+            result = []
+            for row in reversed(rows):  # NSE returns newest-first
+                try:
+                    result.append({
+                        "date": datetime.strptime(row["CH_TIMESTAMP"], "%Y-%m-%d").isoformat(),
+                        "price": round(float(row["CH_CLOSING_PRICE"]), 2),
+                        "open": round(float(row["CH_OPENING_PRICE"]), 2),
+                        "high": round(float(row["CH_TRADE_HIGH_PRICE"]), 2),
+                        "low": round(float(row["CH_TRADE_LOW_PRICE"]), 2),
+                        "volume": int(row.get("CH_TOT_TRADED_QTY", 0) or 0)
+                    })
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if not result:
+                return None
+            self.success += 1
+            return result
+        except Exception as e:
+            logger.warning(f"NSE historical error for {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    async def get_company_info(self, symbol: str) -> Optional[Dict]:
+        """NSE's quote payload has identity/trade fields and P/E, but not
+        ROE/debt-to-equity/EPS etc — those still come from AV/yFinance.
+        Returned in yFinance's camelCase schema so it merges cleanly."""
+        try:
+            await self._ensure_cookies()
+            session = await self._get_session()
+            url = f"{self.BASE}/api/quote-equity?symbol={symbol}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            info_block = data.get("info", {}) or {}
+            metadata = data.get("metadata", {}) or {}
+            price_info = data.get("priceInfo", {}) or {}
+            week = price_info.get("weekHighLow", {}) or {}
+
+            result: Dict = {}
+            if info_block.get("companyName"):
+                result["longName"] = info_block["companyName"]
+                result["shortName"] = info_block["companyName"]
+            if info_block.get("industry"):
+                result["sector"] = info_block["industry"]
+            if metadata.get("pdSymbolPe") not in (None, "", "-"):
+                try:
+                    result["trailingPE"] = float(metadata["pdSymbolPe"])
+                except (ValueError, TypeError):
+                    pass
+            if week.get("max") is not None:
+                result["fiftyTwoWeekHigh"] = float(week["max"])
+            if week.get("min") is not None:
+                result["fiftyTwoWeekLow"] = float(week["min"])
+            return result if result else None
+        except Exception as e:
+            logger.warning(f"NSE company info error for {symbol}: {type(e).__name__}: {e}")
+            return None
+
 
 # ============= OPTIMIZED HYBRID DATA ENGINE =============
 
@@ -108,6 +321,10 @@ class HybridDataEngine:
         # Stats
         self.yf_calls = 0
         self.yf_success = 0
+
+        # NSE direct provider — the only real free source for Indian
+        # equities (.NS/.BO). See NSEDataProvider docstring for why.
+        self.nse_provider = NSEDataProvider()
         
         logger.info(f"🚀 Hybrid Engine initialized: FH={self.fh_enabled}, AV={self.av_enabled}")
     
@@ -565,6 +782,15 @@ class HybridDataEngine:
             cached, ts = self.cache[cache_key]
             if time.time() - ts < self.quote_cache_ttl:
                 return cached
+
+        # Indian equities: Finnhub's free tier doesn't recognize NSE/BSE
+        # symbols at all, so trying it first for .NS/.BO just burns a
+        # guaranteed-miss call. Go straight to NSE's own API instead.
+        if is_indian_stock(symbol):
+            nse_result = await self.nse_provider.get_quote(normalize_indian_symbol(symbol))
+            if nse_result:
+                self.cache[cache_key] = (nse_result, time.time())
+                return nse_result
         
         # Priority 1: Finnhub (Fastest real-time)
         result = await self._fetch_fh_quote(symbol)
@@ -613,6 +839,14 @@ class HybridDataEngine:
             self._inflight_historical.pop(cache_key, None)
 
     async def _fetch_historical_uncached(self, symbol: str, period: str, interval: str, cache_key: str) -> Optional[List[Dict]]:
+        # Indian equities: same reasoning as get_quote() — Finnhub/AV
+        # don't cover NSE/BSE, so try NSE's own historical endpoint first.
+        if is_indian_stock(symbol):
+            nse_result = await self.nse_provider.get_historical(normalize_indian_symbol(symbol), period)
+            if nse_result:
+                self.cache[cache_key] = (nse_result, time.time())
+                return nse_result
+
         # Priority 1: Finnhub (Fastest)
         result = await self._fetch_fh_historical(symbol, period)
         if result:
@@ -666,6 +900,15 @@ class HybridDataEngine:
 
         def still_missing() -> bool:
             return not all(merged.get(k) is not None for k in key_fields)
+
+        # Priority 0: NSE direct (Indian equities only — identity fields,
+        # P/E, and 52-week range; never has ROE/D-to-E/EPS, so the tiers
+        # below still run to fill the rest).
+        if is_indian_stock(symbol):
+            nse_result = await self.nse_provider.get_company_info(normalize_indian_symbol(symbol))
+            if nse_result:
+                for k, v in nse_result.items():
+                    merged.setdefault(k, v)
 
         # Priority 1: Alpha Vantage (best fundamentals when it's not rate-limited)
         av_result = await self._fetch_av_company_info(symbol)
@@ -810,6 +1053,11 @@ class HybridDataEngine:
                 "enabled": True,
                 "calls": self.yf_calls,
                 "success": self.yf_success
+            },
+            "nse_direct": {
+                "enabled": True,
+                "calls": self.nse_provider.calls,
+                "success": self.nse_provider.success
             },
             "cache_size": len(self.cache)
         }
@@ -1387,6 +1635,13 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
         # engine's _fetch_yf_* methods for why this matters: an unbounded
         # yfinance call here could hang the whole /api/stock/{symbol}
         # request well past the frontend's 30s timeout)
+        # FIXED: this path used to call yf_rate_limiter.acquire() without
+        # ever checking is_blocked() first, so while the circuit breaker
+        # was open (Yahoo actively blocking us) it still fired a doomed
+        # request on every single lookup instead of failing fast.
+        if yf_rate_limiter.is_blocked():
+            logger.warning(f"yFinance ultimate fallback skipped for {symbol} — circuit breaker open")
+            return None, {}, None
         await yf_rate_limiter.acquire()
         loop = asyncio.get_event_loop()
         try:
