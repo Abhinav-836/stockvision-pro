@@ -120,6 +120,24 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     return `$${parsedNum.toFixed(0)}`;
   };
 
+  // FIXED: helper that decides whether a growth value is actually
+  // renderable. The old `&&` guard rendered the row whenever the value
+  // was truthy — but "" (empty string) is falsy, 0 is falsy, and null/
+  // undefined are falsy too. That guard was ALSO hiding a real 0% value.
+  // The new guard keeps a real 0% visible, hides null/undefined/empty-
+  // string/NaN, and forces the value through Number() + toFixed(1) so a
+  // stray string like "29.7" or "29.7000001" renders cleanly.
+  const isRenderableGrowth = (val) => {
+    if (val === null || val === undefined) return false;
+    if (val === '') return false;
+    const n = Number(val);
+    return !isNaN(n) && isFinite(n);
+  };
+
+  const formatGrowth = (val) => {
+    return Number(val).toFixed(1);
+  };
+
   const isInWatchlist = stockData && watchlist.includes(stockData.symbol);
 
   const displayData = stockData ? {
@@ -365,14 +383,28 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 <span className="growth-label">Growth Potential</span>
                 <span className="growth-value">{displayData.growth_potential || 'N/A'}</span>
               </div>
-              {displayData.growth_metrics?.revenue_growth && (
+              {/* FIXED: growth metrics — only render a metric when it's a
+                  real finite number. The old `&&` guard rendered
+                  "Earnings Growth: %" whenever the backend sent a string
+                  like "%" or when a value like 0 was treated as falsy
+                  (silently hiding a real 0% growth row). */}
+              {displayData.growth_metrics && (
                 <div className="growth-metrics">
-                  <span className="growth-metric">
-                    Revenue Growth: {displayData.growth_metrics.revenue_growth}%
-                  </span>
-                  <span className="growth-metric">
-                    Earnings Growth: {displayData.growth_metrics.earnings_growth}%
-                  </span>
+                  {isRenderableGrowth(displayData.growth_metrics.revenue_growth) && (
+                    <span className="growth-metric">
+                      Revenue Growth: {formatGrowth(displayData.growth_metrics.revenue_growth)}%
+                    </span>
+                  )}
+                  {isRenderableGrowth(displayData.growth_metrics.earnings_growth) && (
+                    <span className="growth-metric">
+                      Earnings Growth: {formatGrowth(displayData.growth_metrics.earnings_growth)}%
+                    </span>
+                  )}
+                  {isRenderableGrowth(displayData.growth_metrics.earnings_quarterly_growth) && (
+                    <span className="growth-metric">
+                      Quarterly Growth: {formatGrowth(displayData.growth_metrics.earnings_quarterly_growth)}%
+                    </span>
+                  )}
                 </div>
               )}
             </div>

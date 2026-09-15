@@ -319,7 +319,30 @@ def calculate_technical_indicators(hist: pd.DataFrame) -> Dict:
 # ---------------------------------------------------------------------------
 
 def analyze_growth(stock) -> Dict:
-    """Revenue and earnings growth metrics from yFinance info."""
+    """
+    Revenue and earnings growth metrics from yFinance info.
+
+    FIXED: this used to return whatever normalize_percentage() produced,
+    which passed None through when a value was missing — that was fine —
+    BUT yFinance also sometimes returns strings like "29.7%" or "%" for
+    growth fields (particularly for Indian tickers where the data feed
+    is less consistent), and normalize_percentage() rejects any non-
+    numeric input by returning None, so the field was dropped. The
+    frontend then tried to render "Earnings Growth: " with no number,
+    producing the "Earnings Growth: %" artifact.
+
+    Now every value goes through a small _clean() helper that:
+    - Accepts real numbers (int/float)
+    - Accepts numeric strings like "29.7" or "29.7%" (strips the %)
+    - Returns None for anything else (including "", "%", "-", "N/A")
+    - Never emits a bare "%" or an empty string
+
+    Also fixed: `is_growing` used to be `(rev_g or 0) > 0.05 and
+    (earn_g or 0) > 0.05`, which silently treated a MISSING growth value
+    as 0% and made every stock with no earnings-growth data look like it
+    was "not growing". Now both values must be genuinely present and
+    above 5% for the flag to be True.
+    """
     try:
         info = stock.info if hasattr(stock, 'info') else {}
 
@@ -327,12 +350,38 @@ def analyze_growth(stock) -> Dict:
         earn_g = info.get('earningsGrowth')
         eq_g   = info.get('earningsQuarterlyGrowth')
 
+        def _clean(v):
+            """Return a properly-normalized percentage float, or None."""
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return None
+            if isinstance(v, str):
+                # Strip a stray "%" and any whitespace before parsing
+                v = v.replace('%', '').strip()
+                if not v:
+                    return None
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    return None
+            if not isinstance(v, (int, float)):
+                return None
+            if isinstance(v, float) and (v != v):  # NaN check
+                return None
+            return normalize_percentage(v)
+
         result = {
-            "revenue_growth":              normalize_percentage(rev_g),
-            "earnings_growth":             normalize_percentage(earn_g),
-            "earnings_quarterly_growth":   normalize_percentage(eq_g),
+            "revenue_growth":              _clean(rev_g),
+            "earnings_growth":             _clean(earn_g),
+            "earnings_quarterly_growth":   _clean(eq_g),
         }
-        result["is_growing"] = bool((rev_g or 0) > 0.05 and (earn_g or 0) > 0.05)
+
+        rg = result["revenue_growth"]
+        eg = result["earnings_growth"]
+        result["is_growing"] = (
+            rg is not None and eg is not None and rg > 5 and eg > 5
+        )
         return result
 
     except Exception as e:
