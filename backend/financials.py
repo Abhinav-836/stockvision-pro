@@ -540,7 +540,19 @@ def get_latest_news(symbol: str, max_news: int = 5) -> List[Dict]:
         import yfinance as yf
         stock = yf.Ticker(symbol)
         news  = getattr(stock, 'news', None) or []
-        return parse_news_items(news, max_news)
+        parsed = parse_news_items(news, max_news)
+        # Diagnostics: an empty result used to be silent, which made it
+        # impossible to tell "Yahoo returned nothing" from "Yahoo returned
+        # items in a shape the parser doesn't understand".
+        if not news:
+            logger.info(f"yFinance returned no news items for {symbol}")
+        elif not parsed:
+            first = news[0] if isinstance(news[0], dict) else {}
+            logger.warning(
+                f"yFinance returned {len(news)} news items for {symbol} but none parsed; "
+                f"first item keys: {list(first.keys())[:10]}"
+            )
+        return parsed
     except Exception as e:
         logger.error(f"Error fetching news for {symbol}: {e}")
         return []

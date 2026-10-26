@@ -77,6 +77,22 @@ from financials import (
 from ai_service import ai_service
 
 
+def _redact_secrets(text) -> str:
+    """Remove API keys from text before it's logged.
+
+    FIXED: Alpha Vantage echoes your key back in its rate-limit message
+    ("We have detected your API key as XXXX..."), and those messages were
+    logged verbatim — so the key ended up in Render's logs and in every log
+    file shared for debugging.
+    """
+    text = str(text)
+    for env_name in ("ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENROUTER_API_KEY"):
+        secret = os.getenv(env_name)
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "***")
+    return text
+
+
 def _av_number(value) -> Optional[float]:
     """Parse an Alpha Vantage numeric field.
 
@@ -131,7 +147,14 @@ class NSEDataProvider:
         ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        # FIXED: advertised "br" (Brotli) but the Brotli package was never
+        # installed, so NSE answered compressed responses aiohttp couldn't
+        # decode — every NSE historical call failed with "Can not decode
+        # content-encoding: brotli (br)" (seen in production logs) and
+        # Indian charts silently fell back to yFinance. Only encodings
+        # aiohttp can always decode are advertised now (Brotli is also in
+        # requirements.txt as a safety net).
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
         "Referer": "https://www.nseindia.com/",
     }
@@ -174,6 +197,11 @@ class NSEDataProvider:
             url = f"{self.BASE}/api/quote-equity?symbol={symbol}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status != 200:
+                    # FIXED: non-200s used to return None silently, so a
+                    # blocked/expired NSE session was invisible in the logs.
+                    logger.warning(f"NSE quote HTTP {resp.status} for {symbol}")
+                    if resp.status in (401, 403):
+                        self._cookies_ts = 0.0  # force a fresh cookie bootstrap next time
                     return None
                 data = await resp.json(content_type=None)
 
@@ -222,6 +250,9 @@ class NSEDataProvider:
             )
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
+                    logger.warning(f"NSE historical HTTP {resp.status} for {symbol}")
+                    if resp.status in (401, 403):
+                        self._cookies_ts = 0.0
                     return None
                 data = await resp.json(content_type=None)
 
@@ -537,6 +568,17 @@ class HybridDataEngine:
         self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
         return len(self.av_calls_day) < self.av_daily_limit
     
+    def _note_av_daily_limit(self, message) -> None:
+        """AV's own counter is per KEY, not per server process: calls from
+        local testing, other projects or earlier deploys today all count.
+        So the in-process counter can say "3 of 25 used" while AV has
+        already cut the key off. When AV reports its daily limit, stop
+        calling it until midnight instead of burning a request (and a
+        5s-per-minute slot) on every lookup for the rest of the day."""
+        if message and "per day" in str(message):
+            self.av_calls_day = [time.time()] * self.av_daily_limit
+            logger.warning("Alpha Vantage daily quota exhausted for this key — pausing AV until midnight")
+
     def _record_av_call(self):
         now = time.time()
         self.av_calls += 1
@@ -581,7 +623,7 @@ class HybridDataEngine:
                     # a message field instead of an actual quote — these
                     # were previously silent. Surface them.
                     if any(k in data for k in ("Error Message", "Note", "Information")):
-                        logger.warning(f"Alpha Vantage quote rejected for {symbol}: {data}")
+                        logger.warning(f"Alpha Vantage quote rejected for {symbol}: {_redact_secrets(data)}")
         except Exception as e:
             logger.warning(f"Alpha Vantage quote error for {symbol}: {type(e).__name__}: {e}")
         return None
@@ -628,13 +670,14 @@ class HybridDataEngine:
                     self._record_av_call()
                     
                     if "Error Message" in data:
-                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {data.get('Error Message')}")
+                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {_redact_secrets(data.get('Error Message'))}")
                         return None
                     if "Note" in data:
-                        logger.warning(f"Alpha Vantage historical rate-limited for {symbol}: {data.get('Note')}")
+                        logger.warning(f"Alpha Vantage historical rate-limited for {symbol}: {_redact_secrets(data.get('Note'))}")
                         return None
                     if "Information" in data:
-                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {data.get('Information')}")
+                        self._note_av_daily_limit(data.get('Information'))
+                        logger.warning(f"Alpha Vantage historical rejected for {symbol}: {_redact_secrets(data.get('Information'))}")
                         return None
                     
                     time_series = data.get("Time Series (Daily)", {})
@@ -681,6 +724,10 @@ class HybridDataEngine:
                     data = await response.json()
                     self._record_av_call()
                     
+                    if isinstance(data, dict) and "Information" in data:
+                        self._note_av_daily_limit(data.get("Information"))
+                        logger.warning(f"Alpha Vantage overview rejected for {symbol}: {_redact_secrets(data.get('Information'))}")
+                        return None
                     if data and "Symbol" in data:
                         self.av_success += 1
                         # NOTE: Alpha Vantage's OVERVIEW endpoint has no
@@ -863,17 +910,22 @@ class HybridDataEngine:
         # Indian equities: Finnhub's free tier doesn't recognize NSE/BSE
         # symbols at all, so trying it first for .NS/.BO just burns a
         # guaranteed-miss call. Go straight to NSE's own API instead.
-        if is_indian_stock(symbol):
+        indian = is_indian_stock(symbol)
+        if indian:
             nse_result = await self.nse_provider.get_quote(normalize_indian_symbol(symbol))
             if nse_result:
                 self.cache[cache_key] = (nse_result, time.time())
                 return nse_result
         
         # Priority 1: Finnhub (Fastest real-time)
-        result = await self._fetch_fh_quote(symbol)
-        if result:
-            self.cache[cache_key] = (result, time.time())
-            return result
+        # FIXED: when NSE failed, Indian symbols used to fall through to
+        # Finnhub too — which always 403s for .NS/.BO on the free plan (seen
+        # in production logs), wasting a call from the 60/min budget.
+        if not indian:
+            result = await self._fetch_fh_quote(symbol)
+            if result:
+                self.cache[cache_key] = (result, time.time())
+                return result
         
         # Priority 2: yFinance (fallback if Finnhub is down/plan-limited)
         result = await self._fetch_yf_quote(symbol)
@@ -924,11 +976,12 @@ class HybridDataEngine:
                 self.cache[cache_key] = (nse_result, time.time())
                 return nse_result
 
-        # Priority 1: Finnhub (Fastest)
-        result = await self._fetch_fh_historical(symbol, period)
-        if result:
-            self.cache[cache_key] = (result, time.time())
-            return result
+        # Priority 1: Finnhub (Fastest) — not for NSE/BSE (free plan 403s)
+        if not is_indian_stock(symbol):
+            result = await self._fetch_fh_historical(symbol, period)
+            if result:
+                self.cache[cache_key] = (result, time.time())
+                return result
 
         # Alpha Vantage only has free DAILY bars for the last ~100 trading
         # days, it doesn't cover NSE/BSE, and it has no intraday data for
@@ -1018,7 +1071,8 @@ class HybridDataEngine:
 
         # Priority 2: Finnhub (sector/market cap/exchange — never has
         # valuation ratios, but still worth asking for what it does have)
-        if still_missing() or not merged:
+        # Skipped for NSE/BSE: the free plan 403s on .NS/.BO profiles.
+        if (still_missing() or not merged) and not is_indian_stock(symbol):
             fh_result = await self._fetch_fh_company_info(symbol)
             if fh_result:
                 for k, v in _map_av_fh_company_info_to_yf_schema(fh_result).items():
@@ -1830,6 +1884,15 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
             # now the base layer and the live quote is applied on top.
             info = {**(company_info or {}), **quote_fields}
 
+            # FIXED: Finnhub's /quote response has no volume field at all,
+            # so every US stock quoted through Finnhub showed volume 0 ("Vol:
+            # N/A" in the header). Fall back to the company-info volume
+            # when the quote didn't carry one.
+            if not quote_fields["volume"] and company_info:
+                fallback_volume = company_info.get("volume") or company_info.get("regularMarketVolume")
+                if fallback_volume:
+                    info["volume"] = fallback_volume
+
             stock = MockStock(info)
             
             # Convert historical data to DataFrame
@@ -1951,22 +2014,75 @@ async def fetch_news_async(symbol: str, max_news: int = 5) -> List[Dict]:
     cached = news_cache.get(cache_key)
     if cached is not None:
         return cached
-    if yf_rate_limiter.is_blocked():
+
+    news: List[Dict] = []
+    if not yf_rate_limiter.is_blocked():
+        try:
+            loop = asyncio.get_event_loop()
+            news = await asyncio.wait_for(
+                loop.run_in_executor(None, get_latest_news, symbol, max_news),
+                timeout=8
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"News fetch timed out for {symbol}")
+        except Exception as e:
+            logger.warning(f"News fetch failed for {symbol}: {e}")
+
+    # FIXED: in production yFinance news came back empty for every symbol
+    # (through the proxy) without raising, so news was always []. US
+    # symbols now fall back to Finnhub's company-news endpoint, which is
+    # on the free plan. Finnhub has no NSE/BSE coverage, so Indian symbols
+    # only get yFinance news.
+    if not news and not is_indian_stock(symbol):
+        news = await _fetch_finnhub_news(symbol, max_news)
+
+    # FIXED: an empty result used to be cached for the full 15 minutes, so
+    # one failed fetch hid news for that symbol for a quarter of an hour.
+    # Only real results are cached now.
+    if news:
+        news_cache.set(cache_key, news)
+    return news
+
+
+async def _fetch_finnhub_news(symbol: str, max_news: int) -> List[Dict]:
+    """Company news from Finnhub (free plan, US symbols), last 7 days,
+    in the same {title, publisher, link, published} shape as yFinance."""
+    if not hybrid_engine.fh_enabled or not hybrid_engine._can_call_fh():
         return []
     try:
+        today = datetime.now().date()
+        start = (today - timedelta(days=7)).isoformat()
         loop = asyncio.get_event_loop()
-        news = await asyncio.wait_for(
-            loop.run_in_executor(None, get_latest_news, symbol, max_news),
-            timeout=6
+        raw = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: hybrid_engine.fh_client.company_news(symbol, _from=start, to=today.isoformat())
+            ),
+            timeout=8
         )
-    except asyncio.TimeoutError:
-        logger.warning(f"News fetch timed out for {symbol}")
-        return []
+        hybrid_engine._record_fh_call()
     except Exception as e:
-        logger.warning(f"News fetch failed for {symbol}: {e}")
+        logger.warning(f"Finnhub news error for {symbol}: {type(e).__name__}: {e}")
         return []
-    news_cache.set(cache_key, news)
-    return news
+
+    items: List[Dict] = []
+    for item in raw or []:
+        title = (item.get("headline") or "").strip()
+        if not title:
+            continue
+        ts = item.get("datetime")
+        published = (
+            datetime.utcfromtimestamp(ts).isoformat()
+            if isinstance(ts, (int, float)) and ts > 0 else None
+        )
+        items.append({
+            "title": title,
+            "publisher": item.get("source") or "Unknown",
+            "link": item.get("url") or "",
+            "published": published,
+        })
+        if len(items) >= max_news:
+            break
+    return items
 
 
 def build_stock_response(symbol: str, stock, info: Dict, hist, news: Optional[List[Dict]] = None) -> Dict:
