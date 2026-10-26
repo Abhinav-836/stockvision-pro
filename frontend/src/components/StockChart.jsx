@@ -11,7 +11,7 @@ import {
   ReferenceLine
 } from 'recharts';
 
-function StockChart({ history = [], symbol = 'Stock', currentPrice = null, isLoading = false }) {
+function StockChart({ history = [], symbol = 'Stock', currentPrice = null, currency = '$', isLoading = false }) {
   const [expanded, setExpanded] = useState(false);
 
   const data = useMemo(() => {
@@ -99,10 +99,10 @@ function StockChart({ history = [], symbol = 'Stock', currentPrice = null, isLoa
       return (
         <div className="custom-tooltip">
           <div className="tooltip-date">{date}</div>
-          <div className="tooltip-price">${value.toFixed(2)}</div>
+          <div className="tooltip-price">{currency}{value.toFixed(2)}</div>
           {diff !== null && pctDiff !== null && (
             <div className={`tooltip-change ${diff >= 0 ? 'positive' : 'negative'}`}>
-              {diff >= 0 ? '▲' : '▼'} ${Math.abs(diff).toFixed(2)} ({pctDiff >= 0 ? '+' : ''}{pctDiff.toFixed(2)}%)
+              {diff >= 0 ? '▲' : '▼'} {currency}{Math.abs(diff).toFixed(2)} ({pctDiff >= 0 ? '+' : ''}{pctDiff.toFixed(2)}%)
             </div>
           )}
         </div>
@@ -138,7 +138,7 @@ function StockChart({ history = [], symbol = 'Stock', currentPrice = null, isLoa
           />
 
           <YAxis
-            tickFormatter={(v) => `$${v.toFixed(0)}`}
+            tickFormatter={(v) => `${currency}${v.toFixed(0)}`}
             tick={{ fill: '#9ca3af', fontSize: 12 }}
             axisLine={{ stroke: '#2a2e36' }}
             tickLine={{ stroke: '#2a2e36' }}

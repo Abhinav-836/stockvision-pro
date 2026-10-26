@@ -1,6 +1,7 @@
 # backend/ai_service.py  — ENHANCED VERSION
 import os
 import json
+import hashlib
 import logging
 import asyncio
 import time
@@ -86,12 +87,23 @@ class OpenRouterAIService:
         if not self.client:
             return None
 
-        cache_key = f"{prompt[:120]}|{system_prompt[:80] if system_prompt else ''}"
+        # FIXED: the key used to be prompt[:120] + system_prompt[:80]. For
+        # Q&A the first 120 characters are the stock context plus the start
+        # of the question, so two DIFFERENT questions about the same stock
+        # ("Should I buy AAPL before earnings?" / "Should I buy AAPL for
+        # dividends?") got the same cached answer for 15 minutes. Comparison
+        # prompts collided the same way whenever the first stock matched
+        # (AAPL vs MSFT returned the cached AAPL vs GOOGL analysis). The key
+        # now hashes the full request.
+        cache_key = hashlib.sha256(
+            f"{self.model}|{temperature}|{max_tokens}|{system_prompt or ''}|{prompt}".encode("utf-8")
+        ).hexdigest()
         if cache_key in self.cache:
             cached_time, cached_resp = self.cache[cache_key]
             if (datetime.now() - cached_time).total_seconds() < self.cache_ttl:
                 logger.debug("AI cache hit")
                 return cached_resp
+            del self.cache[cache_key]
 
         messages = []
         if system_prompt:
@@ -112,6 +124,13 @@ class OpenRouterAIService:
                 timeout=28.0
             )
             response = completion.choices[0].message.content
+            if not response:
+                return None
+            # Bound the cache: it used to grow forever (one entry per
+            # distinct prompt for the lifetime of the process).
+            if len(self.cache) >= 500:
+                oldest = min(self.cache, key=lambda k: self.cache[k][0])
+                del self.cache[oldest]
             self.cache[cache_key] = (datetime.now(), response)
             return response
         except asyncio.TimeoutError:

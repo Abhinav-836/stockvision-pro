@@ -6,7 +6,7 @@ numpy==2.2.4
 python-multipart==0.0.20
 pydantic==2.11.3
 pydantic-settings==2.8.1
-aiohttp==3.11.14
+aiohttp==3.11.18
 python-dotenv==1.1.0
 openai==1.70.0
 redis==5.2.1

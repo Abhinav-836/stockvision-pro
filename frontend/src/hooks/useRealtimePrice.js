@@ -138,10 +138,14 @@ const useRealtimePrice = (symbol, initialPrice, initialChange) => {
     const pollInterval = setInterval(async () => {
       if (!isCurrent || connectedRef.current) return;
       try {
-        const response = await fetch(`${API_BASE_URL}/api/stock/${symbol}`);
+        const response = await fetch(`${API_BASE_URL}/api/stock/${encodeURIComponent(symbol)}`);
         if (!response.ok || !isCurrent) return;
         const data = await response.json();
         if (!isCurrent) return;
+        // FIXED: when the backend's live sources fail it answers with its
+        // hardcoded demo dataset (is_fallback_data) — polling used to copy
+        // that fake price over the real one already on screen.
+        if (data.is_fallback_data || typeof data.current_price !== 'number') return;
         setPrice(data.current_price);
         setChange(data.change_percent);
       } catch (error) {

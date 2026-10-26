@@ -14,8 +14,21 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
   const [chartData, setChartData] = useState([]);
   const [chartPeriod, setChartPeriod] = useState('1mo');
 
+  // FIXED: for Indian stocks the backend returns symbol: "RELIANCE" (the
+  // display name, suffix stripped) and original_symbol: "RELIANCE.NS".
+  // Every data call below used `symbol`, so after a RELIANCE.NS lookup:
+  //  - the WebSocket subscribed to "RELIANCE" (a non-existent US ticker),
+  //    so Indian stocks never got a live price;
+  //  - the REST polling fallback fetched /api/stock/RELIANCE and replaced
+  //    the real ₹ price with the hardcoded $100 demo price;
+  //  - changing the chart period re-fetched the chart for "RELIANCE" and
+  //    drew a synthetic chart;
+  //  - "Add to watchlist" saved "RELIANCE", which analyzed the wrong stock.
+  // dataSymbol is the exchange-qualified symbol for all of those.
+  const dataSymbol = stockData ? (stockData.original_symbol || stockData.symbol) : null;
+
   const { price: realtimePrice, change: realtimeChange, connected } = useRealtimePrice(
-    stockData?.symbol,
+    dataSymbol,
     stockData?.current_price,
     stockData?.change_percent
   );
@@ -77,8 +90,8 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
   const handlePeriodChange = async (period) => {
     setChartPeriod(period);
-    if (stockData?.symbol) {
-      await fetchChartData(stockData.symbol, period);
+    if (dataSymbol) {
+      await fetchChartData(dataSymbol, period);
     }
   };
 
@@ -98,27 +111,29 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
 
   const popularSymbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'RELIANCE.NS'];
 
-  const formatNumber = (num) => {
-    if (num === null || num === undefined) return 'N/A';
-    if (num === 0) return '$0';
-    if (num >= 1e12) return `$${(num / 1e12).toFixed(2)}T`;
-    if (num >= 1e9) return `$${(num / 1e9).toFixed(2)}B`;
-    if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
-    if (num >= 1e3) return `$${(num / 1e3).toFixed(2)}K`;
-    if (typeof num === 'number' && !isNaN(num)) return `$${num.toFixed(2)}`;
-    return 'N/A';
-  };
+  // FIXED: every price was hardcoded with "$", so Indian stocks (priced
+  // in rupees by NSE/yFinance) were displayed as dollars.
+  const currency = stockData?.is_indian_stock ? '₹' : '$';
+
+  const isNum = (v) => typeof v === 'number' && isFinite(v);
 
   // FIXED: Safer formatLargeNumber function
   const formatLargeNumber = (num) => {
     if (num === null || num === undefined) return 'N/A';
     const parsedNum = typeof num === 'number' ? num : parseFloat(num);
     if (isNaN(parsedNum) || parsedNum === 0) return 'N/A';
-    if (parsedNum >= 1e12) return `$${(parsedNum / 1e12).toFixed(2)}T`;
-    if (parsedNum >= 1e9) return `$${(parsedNum / 1e9).toFixed(2)}B`;
-    if (parsedNum >= 1e6) return `$${(parsedNum / 1e6).toFixed(2)}M`;
-    return `$${parsedNum.toFixed(0)}`;
+    if (parsedNum >= 1e12) return `${currency}${(parsedNum / 1e12).toFixed(2)}T`;
+    if (parsedNum >= 1e9) return `${currency}${(parsedNum / 1e9).toFixed(2)}B`;
+    if (parsedNum >= 1e6) return `${currency}${(parsedNum / 1e6).toFixed(2)}M`;
+    return `${currency}${parsedNum.toFixed(0)}`;
   };
+
+  // FIXED: the metric cards used `value?.toFixed(2) || 'N/A'` and
+  // `value ? ... : 'N/A'`, which hid real zeros and showed an unknown
+  // dividend yield as a confident "0%". Unknown is now always "N/A" and a
+  // real 0 is shown as 0.
+  const fmt = (v, { prefix = '', suffix = '', digits = 2 } = {}) =>
+    isNum(v) ? `${prefix}${v.toFixed(digits)}${suffix}` : 'N/A';
 
   // FIXED: helper that decides whether a growth value is actually
   // renderable. The old `&&` guard rendered the row whenever the value
@@ -138,7 +153,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
     return Number(val).toFixed(1);
   };
 
-  const isInWatchlist = stockData && watchlist.includes(stockData.symbol);
+  const isInWatchlist = Boolean(dataSymbol) && watchlist.includes(dataSymbol.toUpperCase());
 
   const displayData = stockData ? {
     ...stockData,
@@ -188,7 +203,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
             {popularSymbols.map(testSymbol => (
               <button
                 key={testSymbol}
-                onClick={() => handleSearch(testSymbol)}
+                onClick={() => { setSymbol(testSymbol); handleSearch(testSymbol); }}
                 disabled={loading}
                 className="symbol-tag"
               >
@@ -237,7 +252,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               <div className="symbol-wrapper">
                 <h1 className="stock-symbol">{displayData.symbol}</h1>
                 <button
-                  onClick={() => onAddToWatchlist(displayData.symbol)}
+                  onClick={() => onAddToWatchlist(dataSymbol)}
                   className={`watchlist-btn ${isInWatchlist ? 'active' : ''}`}
                 >
                   <i className={`fas fa-star${isInWatchlist ? '' : '-regular'}`}></i>
@@ -269,7 +284,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
             </div>
             <div className="header-right">
               <div className="price-wrapper">
-                <span className="current-price">${displayData.current_price?.toFixed(2)}</span>
+                <span className="current-price">{fmt(displayData.current_price, { prefix: currency })}</span>
                 <div className={`price-change ${displayData.change_percent >= 0 ? 'positive' : 'negative'}`}>
                   <i className={`fas fa-${displayData.change_percent >= 0 ? 'caret-up' : 'caret-down'}`}></i>
                   <span>{displayData.change_percent >= 0 ? '+' : ''}{displayData.change_percent?.toFixed(2)}%</span>
@@ -306,6 +321,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               history={chartData}
               symbol={displayData.symbol}
               currentPrice={displayData.current_price}
+              currency={currency}
               isLoading={chartLoading}
             />
           </div>
@@ -424,47 +440,49 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
               
               <div className="metric-card">
                 <span className="metric-label">P/E Ratio</span>
-                <span className="metric-value">{displayData.pe_ratio?.toFixed(2) || 'N/A'}</span>
+                <span className="metric-value">{fmt(displayData.pe_ratio)}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">P/B Ratio</span>
-                <span className="metric-value">{displayData.pb_ratio?.toFixed(2) || 'N/A'}</span>
+                <span className="metric-value">{fmt(displayData.pb_ratio)}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">EPS</span>
-                <span className="metric-value">{displayData.eps ? `$${displayData.eps.toFixed(2)}` : 'N/A'}</span>
+                <span className="metric-value">{fmt(displayData.eps, { prefix: currency })}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">ROE</span>
-                <span className="metric-value">{displayData.roe ? `${displayData.roe.toFixed(2)}%` : 'N/A'}</span>
+                <span className="metric-value">{fmt(displayData.roe, { suffix: '%' })}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">Div Yield</span>
-                <span className="metric-value">{displayData.dividend_yield ? `${displayData.dividend_yield.toFixed(2)}%` : '0%'}</span>
+                <span className="metric-value">{fmt(displayData.dividend_yield, { suffix: '%' })}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">D/E Ratio</span>
-                <span className="metric-value">{displayData.debt_to_equity?.toFixed(2) || 'N/A'}</span>
+                <span className="metric-value">{fmt(displayData.debt_to_equity)}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">Volatility</span>
-                <span className="metric-value">{displayData.volatility?.toFixed(2) || 'N/A'}</span>
+                <span className="metric-value">
+                  {isNum(displayData.volatility) ? `${(displayData.volatility * 100).toFixed(1)}%` : 'N/A'}
+                </span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">52W High</span>
-                <span className="metric-value">{displayData.fifty_two_week_high ? `$${displayData.fifty_two_week_high.toFixed(2)}` : 'N/A'}</span>
+                <span className="metric-value">{displayData.fifty_two_week_high ? fmt(displayData.fifty_two_week_high, { prefix: currency }) : 'N/A'}</span>
               </div>
               
               <div className="metric-card">
                 <span className="metric-label">52W Low</span>
-                <span className="metric-value">{displayData.fifty_two_week_low ? `$${displayData.fifty_two_week_low.toFixed(2)}` : 'N/A'}</span>
+                <span className="metric-value">{displayData.fifty_two_week_low ? fmt(displayData.fifty_two_week_low, { prefix: currency }) : 'N/A'}</span>
               </div>
               
               <div className="metric-card">
@@ -482,7 +500,7 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                 <h3>Technical Analysis</h3>
               </div>
               <div className="technical-grid">
-                {displayData.technical_indicators.rsi && (
+                {isNum(displayData.technical_indicators.rsi) && (
                   <div className="technical-card">
                     <span className="technical-label">RSI (14)</span>
                     <span className="technical-value">{displayData.technical_indicators.rsi.toFixed(2)}</span>
@@ -498,16 +516,31 @@ function StockForm({ onAddToWatchlist, watchlist = [] }) {
                     </div>
                   </div>
                 )}
-                {displayData.technical_indicators.sma_20 && (
+                {isNum(displayData.technical_indicators.sma_20) && (
                   <div className="technical-card">
                     <span className="technical-label">SMA 20</span>
-                    <span className="technical-value">${displayData.technical_indicators.sma_20.toFixed(2)}</span>
+                    <span className="technical-value">{fmt(displayData.technical_indicators.sma_20, { prefix: currency })}</span>
                   </div>
                 )}
-                {displayData.technical_indicators.sma_50 && (
+                {isNum(displayData.technical_indicators.sma_50) && (
                   <div className="technical-card">
                     <span className="technical-label">SMA 50</span>
-                    <span className="technical-value">${displayData.technical_indicators.sma_50.toFixed(2)}</span>
+                    <span className="technical-value">{fmt(displayData.technical_indicators.sma_50, { prefix: currency })}</span>
+                  </div>
+                )}
+                {isNum(displayData.technical_indicators.sma_200) && (
+                  <div className="technical-card">
+                    <span className="technical-label">SMA 200</span>
+                    <span className="technical-value">{fmt(displayData.technical_indicators.sma_200, { prefix: currency })}</span>
+                  </div>
+                )}
+                {isNum(displayData.technical_indicators.macd) && (
+                  <div className="technical-card">
+                    <span className="technical-label">MACD</span>
+                    <span className="technical-value">
+                      {displayData.technical_indicators.macd.toFixed(2)}
+                      {isNum(displayData.technical_indicators.signal) && ` / ${displayData.technical_indicators.signal.toFixed(2)}`}
+                    </span>
                   </div>
                 )}
                 {displayData.technical_indicators.trend && (

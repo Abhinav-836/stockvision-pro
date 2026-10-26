@@ -12,39 +12,54 @@ logger = logging.getLogger(__name__)
 # CRITICAL FIX: Percentage normalization for yFinance
 # ---------------------------------------------------------------------------
 
+def _is_number(value) -> bool:
+    """True for real, finite ints/floats (bools and NaN excluded)."""
+    if value is None or isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return value == value and value not in (float('inf'), float('-inf'))
+
+
 def normalize_percentage(value: Optional[float]) -> Optional[float]:
     """
     CORRECTLY normalize yFinance percentage values.
-    
+
     yFinance returns values in THREE possible formats:
     1. Decimal: 0.0038 = 0.38% (dividend yield)
     2. Percentage: 15.7 = 15.7% (revenue growth)
     3. Ratio: 1.52 = 152% (ROE - needs *100)
-    
+
     This function intelligently detects which format.
+
+    FIXED: every range check below used to start at 0, so ANY negative
+    value (a shrinking company's revenue growth of -0.05, a loss-maker's
+    negative earnings growth) fell straight through to the "suspicious
+    value" branch and came back as None. The UI then showed declining
+    companies as "no data" instead of "-5.0%", and the AI score/growth
+    label silently treated a real decline as missing. The magnitude is now
+    normalized and the sign re-applied afterwards.
     """
-    if value is None or not isinstance(value, (int, float)):
+    if not _is_number(value):
         return None
-    
+
+    sign = -1 if value < 0 else 1
+    magnitude = abs(value)
+
     # Case 1: Small decimal (0.0001 to 1.0) - treat as decimal rate
     # Example: 0.0038 (dividend) → 0.38%
-    if 0 <= value <= 1:
-        return round(value * 100, 2)
-    
+    if magnitude <= 1:
+        return round(sign * magnitude * 100, 2)
+
     # Case 2: Small value between 1-10 could be a ratio (1.52 = 152% for ROE)
     # Must be checked BEFORE the general percentage range
-    if 1 < value <= 10:
-        return round(value * 100, 2)
+    if magnitude <= 10:
+        return round(sign * magnitude * 100, 2)
 
-    # Case 3: Normal percentage (10% to 100%)
-    # Example: 15.7 → 15.7%
-    if 10 < value <= 100:
-        return round(value, 2)
-    
-    # Case 4: Already large percentage (over 100%)
-    if 100 < value <= 1000:
-        return round(value, 2)
-    
+    # Case 3/4: Already a percentage (10% to 1000%)
+    if magnitude <= 1000:
+        return round(sign * magnitude, 2)
+
     # Case 5: Suspicious value - log and return None
     logger.warning(f"Suspicious percentage value: {value} - returning None")
     return None
@@ -94,21 +109,27 @@ def normalize_roe_roa(value: Optional[float]) -> Optional[float]:
     SPECIALIZED ROE/ROA normalization.
     ROE can be >100% for profitable tech companies.
     """
-    if value is None or not isinstance(value, (int, float)):
+    if not _is_number(value):
         return None
-    
+
+    # FIXED: negative ROE/ROA (any loss-making company) used to return
+    # None because every branch required value >= 0 — the UI showed
+    # "N/A" instead of the real negative return. Sign is now preserved.
+    sign = -1 if value < 0 else 1
+    magnitude = abs(value)
+
     # If value is between 0-1, it's a ratio (0.15 = 15%)
-    if 0 <= value <= 1:
-        return round(value * 100, 2)
-    
+    if magnitude <= 1:
+        return round(sign * magnitude * 100, 2)
+
     # If value is between 1-10, it's likely a ratio (1.52 = 152%)
-    if 1 < value <= 10:
-        return round(value * 100, 2)
-    
+    if magnitude <= 10:
+        return round(sign * magnitude * 100, 2)
+
     # Already percentage
-    if 10 < value <= 500:
-        return round(value, 2)
-    
+    if magnitude <= 500:
+        return round(sign * magnitude, 2)
+
     return None
 
 
@@ -141,15 +162,20 @@ def calculate_pb_ratio(info: Dict) -> Optional[float]:
 def calculate_debt_to_equity(info: Dict) -> Optional[float]:
     """
     Debt-to-Equity ratio.
-    yFinance can return ratio (1.5) or percentage (150).
+
+    FIXED: yFinance's debtToEquity is ALWAYS a percentage (AAPL ~150 means
+    1.5x, a low-debt company's 5.3 means 0.053x). The old code guessed
+    "values above 10 are percentages, values at or below 10 are already
+    ratios" — so every low-debt company (D/E under 10%) was shown with
+    100x its real leverage (0.05 displayed as 5.3), scored 1/10 on
+    financial health and labeled "High Risk". yFinance is the only tier
+    that ever supplies this field (Alpha Vantage, Finnhub and NSE have no
+    D/E at all), so it is always divided by 100.
     """
     try:
         de = info.get('debtToEquity')
-        if de is not None and isinstance(de, (int, float)):
-            # If value > 10, it's likely percentage (150 = 1.5 ratio)
-            if de > 10:
-                de = de / 100
-            return round(float(de), 2)
+        if _is_number(de):
+            return round(float(de) / 100, 2)
     except (ValueError, TypeError):
         pass
     return None
@@ -189,10 +215,34 @@ def calculate_roa(info: Dict) -> Optional[float]:
 
 
 def get_dividend_yield(info: Dict) -> Optional[float]:
-    """Dividend yield as a percentage - FIXED."""
+    """Dividend yield as a percentage.
+
+    FIXED: Yahoo changed dividendYield from a decimal (0.0044 = 0.44%) to
+    an already-multiplied percentage (0.44 = 0.44%) in early 2025, and the
+    pinned yfinance 0.2.66 returns the new format. normalize_dividend_yield
+    can't tell those apart for small yields — a real 0.15% yield (sent as
+    0.15) falls in its "decimal" range and was shown as 15%, which also
+    earned it the "dividend trap" penalty in the AI score.
+
+    The unambiguous source is annual dividend per share divided by price,
+    so that is used whenever both are present. The old heuristic is only
+    the fallback (Alpha Vantage's DividendYield, which is still a decimal,
+    lands there and is handled correctly by it).
+    """
     try:
+        rate = info.get('dividendRate')
+        if rate is None:
+            rate = info.get('trailingAnnualDividendRate')
+        price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        if _is_number(rate) and _is_number(price) and price > 0:
+            if rate == 0:
+                return 0.0
+            computed = rate / price * 100
+            if 0 <= computed <= 25:
+                return round(computed, 2)
+
         dy = info.get('dividendYield')
-        if dy is not None and isinstance(dy, (int, float)):
+        if _is_number(dy):
             return normalize_dividend_yield(dy)
     except (ValueError, TypeError):
         pass
@@ -390,14 +440,20 @@ def analyze_growth(stock) -> Dict:
 
 
 def get_ownership_pattern(stock) -> Dict:
-    """Institutional / insider ownership and short interest."""
+    """Institutional / insider ownership and short interest.
+
+    FIXED: info.get(key, 0) only falls back to 0 when the key is ABSENT.
+    Yahoo frequently sends the key with a null value (very common for
+    Indian tickers), so float(None) raised and the whole ownership block
+    came back empty. `or 0` covers both cases.
+    """
     try:
         info = stock.info if hasattr(stock, 'info') else {}
         return {
-            "institutional_holders": round(float(info.get('heldPercentInstitutions', 0)) * 100, 2),
-            "insider_holders":       round(float(info.get('heldPercentInsiders', 0)) * 100, 2),
-            "short_percent":         round(float(info.get('shortPercentOfFloat', 0)) * 100, 2),
-            "shares_outstanding":    int(info.get('sharesOutstanding', 0)),
+            "institutional_holders": round(float(info.get('heldPercentInstitutions') or 0) * 100, 2),
+            "insider_holders":       round(float(info.get('heldPercentInsiders') or 0) * 100, 2),
+            "short_percent":         round(float(info.get('shortPercentOfFloat') or 0) * 100, 2),
+            "shares_outstanding":    int(info.get('sharesOutstanding') or 0),
         }
     except Exception as e:
         logger.error(f"Error getting ownership pattern: {e}")
@@ -408,47 +464,83 @@ def get_ownership_pattern(stock) -> Dict:
 # News
 # ---------------------------------------------------------------------------
 
+def _parse_news_time(ts) -> Optional[datetime]:
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=None) if ts.tzinfo else ts
+    if isinstance(ts, str):
+        try:
+            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        except ValueError:
+            return None
+    return None
+
+
+def parse_news_items(raw_items, max_news: int = 5) -> List[Dict]:
+    """Normalize yFinance news items into {title, publisher, link, published}.
+
+    FIXED: Yahoo moved news to a new schema in 2025 and the pinned
+    yfinance 0.2.66 returns it: every item is now
+    {"id": ..., "content": {"title", "pubDate", "provider": {"displayName"},
+    "canonicalUrl": {"url"}}} instead of the old flat
+    {"title", "publisher", "link", "providerPublishTime"}. The old parser
+    read item["title"] on the outer dict, got "", and skipped every single
+    item — so news was ALWAYS empty, and the AI thesis/sentiment prompts
+    were built with no headlines at all. Both schemas are handled now.
+    """
+    formatted: List[Dict] = []
+    for item in (raw_items or [])[:max_news * 3]:
+        try:
+            if not isinstance(item, dict):
+                continue
+            content = item.get('content') if isinstance(item.get('content'), dict) else None
+
+            if content:
+                title = (content.get('title') or '').strip()
+                provider = content.get('provider') or {}
+                publisher = provider.get('displayName') if isinstance(provider, dict) else None
+                link = ((content.get('canonicalUrl') or {}).get('url')
+                        or (content.get('clickThroughUrl') or {}).get('url') or '')
+                published = _parse_news_time(content.get('pubDate') or content.get('displayTime'))
+            else:
+                title = (item.get('title') or '').strip()
+                publisher = item.get('publisher')
+                link = item.get('link') or ''
+                published = _parse_news_time(item.get('providerPublishTime'))
+
+            if not title or title.lower() in ('untitled', 'news'):
+                continue
+
+            formatted.append({
+                "title":     title,
+                "publisher": publisher or 'Unknown',
+                "link":      link,
+                "published": published.isoformat() if published else None,
+            })
+            if len(formatted) >= max_news:
+                break
+        except Exception as e:
+            logger.debug(f"Skipping malformed news item: {e}")
+            continue
+    return formatted
+
+
 def get_latest_news(symbol: str, max_news: int = 5) -> List[Dict]:
-    """Fetch latest news headlines from yFinance."""
+    """Fetch latest news headlines from yFinance.
+
+    NOTE: this is a BLOCKING network call. Never call it directly from an
+    async endpoint — main.py wraps it in fetch_news_async(), which runs it
+    in a worker thread with a timeout.
+    """
     try:
         import yfinance as yf
         stock = yf.Ticker(symbol)
         news  = getattr(stock, 'news', None) or []
-
-        formatted: List[Dict] = []
-        for item in news[:max_news * 2]:
-            try:
-                title = item.get('title', '').strip()
-                if not title or title.lower() in ['', 'untitled', 'news']:
-                    continue
-                
-                ts = item.get('providerPublishTime')
-                if ts is not None:
-                    if isinstance(ts, (int, float)):
-                        dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
-                    elif isinstance(ts, datetime):
-                        dt = ts.replace(tzinfo=None) if ts.tzinfo else ts
-                    else:
-                        dt = None
-                else:
-                    dt = None
-
-                formatted.append({
-                    "title":     title,
-                    "publisher": item.get('publisher', 'Unknown'),
-                    "link":      item.get('link', ''),
-                    "published": dt.isoformat() if dt else None,
-                })
-                
-                if len(formatted) >= max_news:
-                    break
-                    
-            except Exception as e:
-                logger.debug(f"Skipping malformed news item for {symbol}: {e}")
-                continue
-
-        return formatted
-
+        return parse_news_items(news, max_news)
     except Exception as e:
         logger.error(f"Error fetching news for {symbol}: {e}")
         return []

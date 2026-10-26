@@ -76,6 +76,28 @@ from financials import (
 
 from ai_service import ai_service
 
+
+def _av_number(value) -> Optional[float]:
+    """Parse an Alpha Vantage numeric field.
+
+    AV returns every number as a string and uses the literal strings
+    "None", "-" or "" for missing values; percentages sometimes carry a
+    trailing "%". Returns None for anything that isn't a real number.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).replace("%", "").strip()
+    if text in ("", "None", "-", "N/A", "null"):
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if number == number else None  # drop NaN
+
+
 # ============= NSE DIRECT PROVIDER (Indian equities) =============
 
 class NSEDataProvider:
@@ -495,19 +517,25 @@ class HybridDataEngine:
     # ========================================================================
     
     def _can_call_av(self) -> bool:
-        """Check Alpha Vantage rate limit (5/min, 500/day)"""
+        """Check Alpha Vantage rate limit (5/min, av_daily_limit/day).
+
+        FIXED: the daily check was still hardcoded to `< 500` even after
+        self.av_daily_limit was corrected to AV's real free-tier quota of
+        25. The limit was never actually enforced — the app kept firing
+        AV requests all day after the real quota was gone.
+        """
         now = time.time()
         self.av_calls_minute = [t for t in self.av_calls_minute if now - t < 60]
         if len(self.av_calls_minute) >= 5:
             return False
-        
+
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         if today > self.av_day_reset:
             self.av_calls_day = []
             self.av_day_reset = today
-        
+
         self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
-        return len(self.av_calls_day) < 500
+        return len(self.av_calls_day) < self.av_daily_limit
     
     def _record_av_call(self):
         now = time.time()
@@ -558,18 +586,39 @@ class HybridDataEngine:
             logger.warning(f"Alpha Vantage quote error for {symbol}: {type(e).__name__}: {e}")
         return None
     
+    # Calendar days each chart period covers. Alpha Vantage's free
+    # TIME_SERIES_DAILY only serves outputsize=compact (latest 100 trading
+    # days ≈ 140 calendar days); outputsize=full is a premium feature.
+    PERIOD_DAYS = {"1d": 1, "5d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 731, "5y": 1827}
+    AV_COMPACT_MAX_DAYS = 140
+
+    def av_covers_period(self, period: str) -> bool:
+        return self.PERIOD_DAYS.get(period, 31) <= self.AV_COMPACT_MAX_DAYS
+
     async def _fetch_av_historical(self, symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
-        """Fetch historical from Alpha Vantage"""
+        """Fetch historical from Alpha Vantage.
+
+        FIXED (3 bugs):
+        1. 3mo/6mo/1y requested outputsize=full, which is premium-only on
+           AV's free tier. Every one of those requests came back as an
+           "Information" rejection — guaranteed to fail, but still burning
+           one of the 25 daily calls. Always compact now.
+        2. Rows were returned NEWEST-FIRST (sorted reverse=True). Every
+           other tier returns oldest-first, and everything downstream
+           assumes it: hist['Close'].iloc[-1] became the OLDEST close, so
+           RSI/MACD/SMA trend, the price fallback and volatility were all
+           computed backwards whenever AV served the data.
+        3. The period was ignored — "1mo" returned 100 trading days
+           (~5 months), so the 1M chart showed five months of data.
+        """
         if not self.av_enabled or not self._can_call_av():
             return None
-        
-        output_size = "compact" if period in ["1d", "5d", "1mo"] else "full"
-        
+
         try:
             params = {
                 "function": "TIME_SERIES_DAILY",
                 "symbol": symbol,
-                "outputsize": output_size,
+                "outputsize": "compact",
                 "apikey": self.av_api_key
             }
             
@@ -590,8 +639,12 @@ class HybridDataEngine:
                     
                     time_series = data.get("Time Series (Daily)", {})
                     if time_series:
+                        cutoff = (datetime.now() - timedelta(days=self.PERIOD_DAYS.get(period, 31))).strftime("%Y-%m-%d")
                         result = []
-                        for date, values in sorted(time_series.items(), reverse=True)[:100]:
+                        # Oldest-first, like every other tier.
+                        for date, values in sorted(time_series.items()):
+                            if date < cutoff:
+                                continue
                             try:
                                 result.append({
                                     "date": date,
@@ -632,33 +685,45 @@ class HybridDataEngine:
                         self.av_success += 1
                         # NOTE: Alpha Vantage's OVERVIEW endpoint has no
                         # "DebtToEquity" field at all — it never existed in
-                        # their schema. The old code did
-                        # data.get("DebtToEquity", 0), which silently faked
-                        # every single stock as debt-free (D/E = 0.00)
-                        # instead of correctly reporting "unavailable".
-                        # Also "RevenueGrowth" isn't a real AV field either;
-                        # the correct key is "QuarterlyRevenueGrowthYOY".
+                        # their schema. Also "RevenueGrowth" isn't a real AV
+                        # field either; the correct key is
+                        # "QuarterlyRevenueGrowthYOY".
+                        #
+                        # FIXED: AV sends the literal STRING "None" (or "-")
+                        # for any field it doesn't have — e.g. PERatio for
+                        # every loss-making company, DividendYield for
+                        # non-payers. float("None") raised ValueError, the
+                        # except below swallowed it, and the ENTIRE AV
+                        # result was thrown away (after spending one of the
+                        # 25 daily calls). Every field is parsed with
+                        # _av_number() now and simply omitted when missing.
+                        #
+                        # FIXED: QuarterlyRevenueGrowthYOY is a decimal
+                        # (0.061 = 6.1%), the same unit yFinance uses. It
+                        # used to be multiplied by 100 here, and then
+                        # analyze_growth() multiplied by 100 AGAIN — so a
+                        # 6.1% grower was displayed as 610% growth.
                         result = {
                             "symbol": data.get("Symbol"),
                             "company_name": data.get("Name"),
                             "sector": data.get("Sector"),
                             "industry": data.get("Industry"),
-                            "market_cap": float(data.get("MarketCapitalization", 0)),
-                            "pe_ratio": float(data.get("PERatio", 0)),
-                            "pb_ratio": float(data.get("PriceToBookRatio", 0)),
-                            "roe": float(data.get("ReturnOnEquityTTM", "0").replace("%", "")),
-                            "roa": float(data.get("ReturnOnAssetsTTM", "0").replace("%", "")),
-                            "dividend_yield": float(data.get("DividendYield", "0").replace("%", "")),
-                            "eps": float(data.get("EPS", 0)),
                         }
-                        # These two genuinely aren't in AV's schema — only
-                        # include them if a value is actually present,
-                        # so downstream correctly treats them as unknown
-                        # (N/A) rather than a fake confident zero.
-                        if data.get("DebtToEquity") not in (None, "None", "-", ""):
-                            result["debt_to_equity"] = float(data["DebtToEquity"])
-                        if data.get("QuarterlyRevenueGrowthYOY") not in (None, "None", "-", ""):
-                            result["revenue_growth"] = float(data["QuarterlyRevenueGrowthYOY"]) * 100
+                        numeric_fields = {
+                            "market_cap": "MarketCapitalization",
+                            "pe_ratio": "PERatio",
+                            "pb_ratio": "PriceToBookRatio",
+                            "roe": "ReturnOnEquityTTM",
+                            "roa": "ReturnOnAssetsTTM",
+                            "dividend_yield": "DividendYield",
+                            "eps": "EPS",
+                            "debt_to_equity": "DebtToEquity",
+                            "revenue_growth": "QuarterlyRevenueGrowthYOY",
+                        }
+                        for out_key, av_key in numeric_fields.items():
+                            value = _av_number(data.get(av_key))
+                            if value is not None:
+                                result[out_key] = value
                         return result
         except Exception as e:
             logger.warning(f"Alpha Vantage company info error for {symbol}: {type(e).__name__}: {e}")
@@ -744,18 +809,30 @@ class HybridDataEngine:
         return None
     
     async def _fetch_yf_company_info(self, symbol: str) -> Optional[Dict]:
-        """Fetch company info from yFinance (fallback)"""
+        """Fetch company info from yFinance (fallback).
+
+        FIXED: this was the only yFinance call that ignored the circuit
+        breaker — it neither checked is_blocked() nor recorded
+        success/failure. While Yahoo was actively blocking the server it
+        kept firing (and waiting out its 8s timeouts) on every lookup, and
+        its failures never counted toward opening the breaker.
+        """
+        if yf_rate_limiter.is_blocked():
+            return None
         try:
             await yf_rate_limiter.acquire()
             loop = asyncio.get_event_loop()
             stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
             info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
             self.yf_calls += 1
-            
+
             if info:
                 self.yf_success += 1
+                yf_rate_limiter.record_success()
                 return info
+            yf_rate_limiter.record_failure()
         except Exception as e:
+            yf_rate_limiter.record_failure()
             logger.warning(f"yFinance company info error for {symbol}: {type(e).__name__}: {e}")
         return None
     
@@ -852,19 +929,38 @@ class HybridDataEngine:
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
-        
-        # Priority 2: Alpha Vantage (Good data)
-        result = await self._fetch_av_historical(symbol, period)
-        if result:
-            self.cache[cache_key] = (result, time.time())
-            return result
-        
-        # Priority 3: yFinance (Ultimate fallback)
+
+        # Alpha Vantage only has free DAILY bars for the last ~100 trading
+        # days, it doesn't cover NSE/BSE, and it has no intraday data for
+        # the 1D/5D charts. Only spend one of its 25 daily calls when it
+        # can actually answer the request; otherwise go to yFinance.
+        av_useful = (
+            not is_indian_stock(symbol)
+            and interval == "1d"
+            and period not in ("1d", "5d")
+        )
+
+        if av_useful and self.av_covers_period(period):
+            # Priority 2: Alpha Vantage (fully covers this period)
+            result = await self._fetch_av_historical(symbol, period)
+            if result:
+                self.cache[cache_key] = (result, time.time())
+                return result
+
+        # Priority 3: yFinance
         result = await self._fetch_yf_historical(symbol, period, interval)
         if result:
             self.cache[cache_key] = (result, time.time())
             return result
-        
+
+        if av_useful and not self.av_covers_period(period):
+            # Last resort for long periods: AV's ~5 months is still real
+            # data and far better than a synthetic chart.
+            result = await self._fetch_av_historical(symbol, period)
+            if result:
+                self.cache[cache_key] = (result, time.time())
+                return result
+
         return None
     
     async def get_company_info(self, symbol: str) -> Optional[Dict]:
@@ -911,10 +1007,14 @@ class HybridDataEngine:
                     merged.setdefault(k, v)
 
         # Priority 1: Alpha Vantage (best fundamentals when it's not rate-limited)
-        av_result = await self._fetch_av_company_info(symbol)
-        if av_result:
-            for k, v in _map_av_fh_company_info_to_yf_schema(av_result).items():
-                merged.setdefault(k, v)
+        # FIXED: skipped for Indian symbols — AV's OVERVIEW endpoint has no
+        # NSE/BSE coverage, so "RELIANCE.NS" always came back empty while
+        # still consuming one of the 25 free calls per day.
+        if not is_indian_stock(symbol):
+            av_result = await self._fetch_av_company_info(symbol)
+            if av_result:
+                for k, v in _map_av_fh_company_info_to_yf_schema(av_result).items():
+                    merged.setdefault(k, v)
 
         # Priority 2: Finnhub (sector/market cap/exchange — never has
         # valuation ratios, but still worth asking for what it does have)
@@ -934,7 +1034,27 @@ class HybridDataEngine:
                     merged.setdefault(k, v)
 
         return merged if merged else None
-    
+
+    async def get_company_identity(self, symbol: str) -> Dict:
+        """Name + market cap only, for lightweight lists (trending).
+
+        Uses Finnhub's profile (60 calls/min) and never Alpha Vantage or
+        yFinance — the trending endpoint used to call get_company_info()
+        for 7 symbols, spending up to 7 of Alpha Vantage's 25 daily calls
+        on a single page load just to show company names.
+        """
+        cache_key = f"identity:{symbol}"
+        cached = self.cache.get(cache_key)
+        if cached and time.time() - cached[1] < 3600:
+            return cached[0]
+        identity: Dict = {}
+        fh = await self._fetch_fh_company_info(symbol)
+        if fh:
+            identity = _map_av_fh_company_info_to_yf_schema(fh)
+        if identity:
+            self.cache[cache_key] = (identity, time.time())
+        return identity
+
     async def get_indices(self, symbols: List[str]) -> List[Dict]:
         """Get market indices data.
 
@@ -1122,8 +1242,17 @@ class ConnectionManager:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
         for symbol in list(self.subscriptions.keys()):
-            if websocket in self.subscriptions[symbol]:
-                self.subscriptions[symbol].remove(websocket)
+            self.unsubscribe(websocket, symbol)
+
+    def unsubscribe(self, websocket: WebSocket, symbol: str):
+        subscribers = self.subscriptions.get(symbol)
+        if not subscribers:
+            return
+        if websocket in subscribers:
+            subscribers.remove(websocket)
+        if not subscribers:
+            # No one is watching this symbol anymore — stop polling it.
+            self.subscriptions.pop(symbol, None)
 
     async def subscribe(self, websocket: WebSocket, symbol: str):
         if symbol not in self.subscriptions:
@@ -1134,23 +1263,23 @@ class ConnectionManager:
     async def broadcast_to_symbol(self, symbol: str, message: dict):
         if symbol in self.subscriptions:
             dead = []
-            for connection in self.subscriptions[symbol]:
+            for connection in list(self.subscriptions.get(symbol, [])):
                 try:
                     await connection.send_json(message)
                 except Exception:
                     dead.append(connection)
             for d in dead:
-                self.subscriptions[symbol].remove(d)
+                self.disconnect(d)
 
     async def broadcast_all(self, message: dict):
         dead = []
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception:
                 dead.append(connection)
         for d in dead:
-            self.active_connections.remove(d)
+            self.disconnect(d)
 
 manager = ConnectionManager()
 
@@ -1165,6 +1294,10 @@ class Config:
     ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 config = Config()
+
+# One year of daily bars: enough for SMA-200, a meaningful annualized
+# volatility, and a real 52-week high/low fallback.
+ANALYSIS_HISTORY_PERIOD = "1y"
 
 # ============= LRU CACHE =============
 class LRUCache:
@@ -1251,19 +1384,54 @@ app = FastAPI(
     redoc_url="/api/redoc"
 )
 
+# FIXED: ALLOWED_ORIGINS was read from the environment into config but
+# never used — CORS was hardcoded to "*". It's honored now (default is
+# still "*"). Credentials are only allowed with an explicit origin list,
+# since the browser spec forbids credentials with a wildcard origin and the
+# frontend never sends cookies anyway.
+_allowed_origins = [o.strip() for o in config.ALLOWED_ORIGINS if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allowed_origins,
+    allow_credentials="*" not in _allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+def get_client_ip(request: Optional[Request]) -> str:
+    """Real client IP, even behind Render/Railway/Vercel's proxy.
+
+    FIXED: request.client.host on a hosted platform is the platform's own
+    load balancer, not the visitor. The per-IP limiter below therefore put
+    EVERY visitor in one shared 60-requests/minute bucket — a single page
+    load fires ~5 requests and the ticker polls every minute, so a handful
+    of simultaneous users started getting 429s. The AI per-user limiter had
+    the same problem (10 AI calls/minute shared by everyone). The first
+    X-Forwarded-For hop is the original client.
+    """
+    if request is None:
+        return "anonymous"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     now = time.time()
     request_counts[client_ip] = [t for t in request_counts[client_ip] if now - t < 60]
+    # Drop idle IPs so the dict doesn't grow forever.
+    if len(request_counts) > 5000:
+        for ip in [ip for ip, ts in request_counts.items() if not ts]:
+            del request_counts[ip]
     if len(request_counts[client_ip]) >= 60:
         return JSONResponse(
             status_code=429,
@@ -1276,15 +1444,20 @@ async def rate_limit_middleware(request: Request, call_next):
     return response
 
 # ============= MODELS =============
+# FIXED: the old pattern ^[A-Z0-9]{1,10}(\.[A-Z]{2,3})?$ rejected real
+# tickers: hyphenated ones (BRK-B, BAJAJ-AUTO.NS) and ampersands (M&M.NS).
+SYMBOL_PATTERN = re.compile(r'^[A-Z0-9&\-]{1,15}(\.[A-Z]{1,3})?$')
+
+
 class StockRequest(BaseModel):
-    symbol: str = Field(..., min_length=1, max_length=15)
+    symbol: str = Field(..., min_length=1, max_length=20)
 
     @validator('symbol')
     def validate_symbol(cls, v):
         v = v.upper().strip()
         if not v:
             raise ValueError('Symbol cannot be empty')
-        if not re.match(r'^[A-Z0-9]{1,10}(\.[A-Z]{2,3})?$', v):
+        if not SYMBOL_PATTERN.match(v):
             raise ValueError('Invalid symbol format')
         return v
 
@@ -1300,7 +1473,7 @@ class CompareRequest(BaseModel):
         cleaned = []
         for symbol in v:
             symbol = symbol.upper().strip()
-            if not re.match(r'^[A-Z0-9]{1,10}(\.[A-Z]{2,3})?$', symbol):
+            if not SYMBOL_PATTERN.match(symbol):
                 raise ValueError(f'Invalid symbol: {symbol}')
             cleaned.append(symbol)
         if len(cleaned) != len(set(cleaned)):
@@ -1310,30 +1483,66 @@ class CompareRequest(BaseModel):
 # ============= WEBSOCKET =============
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """Live price subscriptions.
+
+    FIXED:
+    - Symbols are normalized (upper-case, stripped) and validated. A
+      lower-case or junk symbol used to create its own subscription key,
+      which price_updater then polled through the data providers every 5s
+      forever.
+    - Empty subscription lists are removed on unsubscribe, so
+      price_updater stops fetching symbols nobody is watching anymore
+      (they used to stay in the dict and be polled forever).
+    - Any error other than a clean WebSocketDisconnect (e.g. the client
+      vanishing mid-send) left the dead socket registered in
+      active_connections and subscriptions. Cleanup now always runs.
+    """
     await manager.connect(websocket)
     try:
         while True:
             data = await websocket.receive_text()
             try:
                 message = json.loads(data)
+                if not isinstance(message, dict):
+                    raise ValueError("message must be an object")
                 message_type = message.get('type')
+                raw_symbol = message.get('symbol')
+                symbol = str(raw_symbol).upper().strip() if raw_symbol else ""
                 if message_type == 'subscribe':
-                    symbol = message.get('symbol')
-                    if symbol:
+                    if symbol and SYMBOL_PATTERN.match(symbol):
                         await manager.subscribe(websocket, symbol)
                         await websocket.send_json({
                             "type": "subscribed",
                             "symbol": symbol,
                             "status": "success"
                         })
+                        # A second viewer of an already-tracked symbol would
+                        # otherwise wait until the price next moves before
+                        # seeing anything — send the latest known quote now.
+                        cached_quote = hybrid_engine.cache.get(f"quote:{symbol}")
+                        if cached_quote and cached_quote[0].get('price'):
+                            q = cached_quote[0]
+                            await websocket.send_json({
+                                "type": "price_update",
+                                "symbol": symbol,
+                                "price": round(q['price'], 2),
+                                "change": round(q.get('change_percent', 0) or 0, 2),
+                                "timestamp": datetime.now().isoformat(),
+                                "source": q.get('source', 'unknown')
+                            })
+                    else:
+                        await websocket.send_json({"type": "error", "message": "Invalid symbol"})
                 elif message_type == 'unsubscribe':
-                    symbol = message.get('symbol')
-                    if symbol and symbol in manager.subscriptions:
-                        if websocket in manager.subscriptions[symbol]:
-                            manager.subscriptions[symbol].remove(websocket)
-            except json.JSONDecodeError:
+                    manager.unsubscribe(websocket, symbol)
+                elif message_type == 'ping':
+                    await websocket.send_json({"type": "pong"})
+            except (json.JSONDecodeError, ValueError):
                 await websocket.send_json({"type": "error", "message": "Invalid JSON"})
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug(f"WebSocket closed with error: {type(e).__name__}: {e}")
+    finally:
         manager.disconnect(websocket)
 
 # ============= BACKGROUND TASKS =============
@@ -1395,10 +1604,19 @@ async def price_updater():
                             if quote and quote.get('price'):
                                 current_price = quote['price']
                                 change = quote.get('change_percent', 0)
-                                
-                                # Check if price changed significantly
-                                last_price = last_prices.get(symbol, current_price)
-                                if abs(current_price - last_price) > 0.05 or abs(change) > 0.5:
+
+                                # FIXED: the old condition was
+                                # `abs(price - last) > 0.05 or abs(change) > 0.5`
+                                # with last defaulting to the current price.
+                                # On a calm day (|change| < 0.5%) the first
+                                # tick was never sent, so subscribers never got
+                                # a live price at all; on a volatile day the
+                                # SAME cached price was re-broadcast every 5s
+                                # because the daily % alone kept the condition
+                                # true. Now: send the first tick, then only
+                                # when the price actually moves.
+                                last_price = last_prices.get(symbol)
+                                if last_price is None or abs(current_price - last_price) >= 0.01:
                                     await manager.broadcast_to_symbol(symbol, {
                                         "type": "price_update",
                                         "symbol": symbol,
@@ -1570,20 +1788,26 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
 
         # Use hybrid engine for quote (fastest available)
         quote = await hybrid_engine.get_quote(symbol)
-        
-        # Use hybrid engine for historical
-        hist_data = await hybrid_engine.get_historical(symbol, "1mo")
-        
+
+        # FIXED: analysis used to pull only "1mo" of history (~21 trading
+        # days). That made SMA-50 and SMA-200 permanently impossible (the
+        # UI never showed them, despite the README advertising them), left
+        # volatility computed from barely 20 returns, and the "52W
+        # High/Low" fallback was really a 1-month high/low. One year of
+        # daily bars costs the same single yFinance/NSE request, and it
+        # shares its cache with the 1Y chart.
+        hist_data = await hybrid_engine.get_historical(symbol, ANALYSIS_HISTORY_PERIOD, "1d")
+
         # Get company info (priority: Alpha Vantage → Finnhub → yFinance)
         company_info = await hybrid_engine.get_company_info(symbol)
-        
+
         # If we have quote data, convert to yFinance-like format
         if quote:
             class MockStock:
                 def __init__(self, info_dict):
                     self.info = info_dict
-                    
-            info = {
+
+            quote_fields = {
                 "symbol": symbol,
                 "currentPrice": quote.get("price", 0),
                 "regularMarketPrice": quote.get("price", 0),
@@ -1595,11 +1819,17 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
                 "dayLow": quote.get("low", 0),
                 "open": quote.get("open", 0),
             }
-            
-            # Add company info if available
-            if company_info:
-                info.update(company_info)
-            
+
+            # FIXED: this used to be info = quote_fields; info.update(company_info).
+            # When the company info came from yFinance (the usual case for
+            # the ratio fields), its .info dict ALSO contains currentPrice,
+            # previousClose, volume, dayHigh, dayLow... — so update()
+            # silently overwrote the real-time Finnhub/NSE quote with
+            # yFinance's delayed snapshot. The header price and change %
+            # then disagreed with the live WebSocket ticks. Company info is
+            # now the base layer and the live quote is applied on top.
+            info = {**(company_info or {}), **quote_fields}
+
             stock = MockStock(info)
             
             # Convert historical data to DataFrame
@@ -1647,17 +1877,23 @@ async def fetch_stock_data(symbol: str, use_cache: bool = True):
         try:
             stock = await asyncio.wait_for(loop.run_in_executor(None, yf.Ticker, symbol), timeout=8)
             info = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.info or {}), timeout=8)
-            hist = await asyncio.wait_for(loop.run_in_executor(None, lambda: stock.history(period="1mo")), timeout=10)
+            hist = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: stock.history(period=ANALYSIS_HISTORY_PERIOD)),
+                timeout=10
+            )
         except asyncio.TimeoutError:
+            yf_rate_limiter.record_failure()
             logger.warning(f"yFinance ultimate fallback timed out for {symbol}")
             return None, {}, None
 
         if hist is not None and not hist.empty:
+            yf_rate_limiter.record_success()
             result = (stock, info, hist)
             if use_cache:
                 stock_cache.set(cache_key, result)
             return result
 
+        yf_rate_limiter.record_failure()
         return None, {}, None
 
     except Exception as e:
@@ -1695,7 +1931,45 @@ def calculate_price_metrics(info: Dict, hist) -> Dict:
         logger.error(f"Error calculating price metrics: {e}")
         return {"current_price": 0.0, "previous_close": 0.0, "change": 0.0, "change_percent": 0.0, "day_high": 0.0, "day_low": 0.0, "volume": 0}
 
-def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
+news_cache = LRUCache(max_size=500, ttl=900)
+
+
+async def fetch_news_async(symbol: str, max_news: int = 5) -> List[Dict]:
+    """Non-blocking, timeout-bounded, cached news fetch.
+
+    FIXED: build_stock_response() used to call get_latest_news() directly.
+    That is a synchronous yFinance HTTP request, and build_stock_response
+    runs inside async endpoints — so every analysis BLOCKED THE WHOLE EVENT
+    LOOP for the duration of a Yahoo round-trip (no timeout, no circuit
+    breaker). While it hung, every other user's request, the WebSocket
+    price pushes and the background updaters all froze with it. /api/compare
+    did this once per stock, serially, and /api/ai/thesis fetched the same
+    news twice. News now runs in a worker thread with a timeout, respects
+    the yFinance circuit breaker, and is cached for 15 minutes.
+    """
+    cache_key = f"news:{symbol}:{max_news}"
+    cached = news_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if yf_rate_limiter.is_blocked():
+        return []
+    try:
+        loop = asyncio.get_event_loop()
+        news = await asyncio.wait_for(
+            loop.run_in_executor(None, get_latest_news, symbol, max_news),
+            timeout=6
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"News fetch timed out for {symbol}")
+        return []
+    except Exception as e:
+        logger.warning(f"News fetch failed for {symbol}: {e}")
+        return []
+    news_cache.set(cache_key, news)
+    return news
+
+
+def build_stock_response(symbol: str, stock, info: Dict, hist, news: Optional[List[Dict]] = None) -> Dict:
     try:
         price_metrics    = calculate_price_metrics(info, hist)
         pe_ratio         = calculate_pe_ratio(info)
@@ -1710,7 +1984,7 @@ def build_stock_response(symbol: str, stock, info: Dict, hist) -> Dict:
         technical_indicators = calculate_technical_indicators(hist)
         growth_metrics   = analyze_growth(stock)
         ownership        = get_ownership_pattern(stock)
-        news             = get_latest_news(symbol)
+        news             = news or []
 
         metrics = {
             'pe_ratio': pe_ratio, 'pb_ratio': pb_ratio,
@@ -1806,10 +2080,13 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
             if cached:
                 return cached
 
-        result = await fetch_stock_data(symbol, use_cache=False)
+        result, news = await asyncio.gather(
+            fetch_stock_data(symbol, use_cache=False),
+            fetch_news_async(symbol),
+        )
         if result and result[0] is not None and result[2] is not None:
             stock, info, hist = result
-            response_data = build_stock_response(symbol, stock, info, hist)
+            response_data = build_stock_response(symbol, stock, info, hist, news)
             if use_cache:
                 stock_cache.set(cache_key, response_data)
             # Remember this as the last known-good REAL data for this symbol
@@ -1945,72 +2222,96 @@ async def get_stock_chart(symbol: str, period: str = "1mo", use_cache: bool = Tr
         logger.error(f"Error fetching chart for {symbol}: {e}")
         return []
 
+async def _load_stocks_for_comparison(symbols: List[str]):
+    """Fetch and build every stock in a comparison concurrently.
+
+    Shared by /api/compare and /api/ai/compare (they used to duplicate this
+    loop with slightly different failure handling). Uses the same
+    last-known-good fallback as /api/stock/{symbol}, so a transient outage
+    shows slightly stale REAL data instead of the hardcoded demo dataset.
+    """
+    results, news_lists = await asyncio.gather(
+        asyncio.gather(*[fetch_stock_data(s) for s in symbols], return_exceptions=True),
+        asyncio.gather(*[fetch_news_async(s) for s in symbols]),
+    )
+    stocks_data: List[Dict] = []
+    failed: List[str] = []
+    for symbol, result, news in zip(symbols, results, news_lists):
+        built = None
+        if not isinstance(result, Exception) and result and result[0] is not None and result[2] is not None:
+            try:
+                stock, info, hist = result
+                built = build_stock_response(symbol, stock, info, hist, news)
+                last_good_stock_cache.set(symbol, built)
+            except Exception as e:
+                logger.warning(f"Comparison build failed for {symbol}: {e}")
+        if built is None:
+            failed.append(symbol)
+            last_good = last_good_stock_cache.get(symbol)
+            built = {**last_good, "is_stale": True} if last_good else get_fallback_stock_data(symbol)
+        stocks_data.append(built)
+    return stocks_data, failed
+
+
+def _build_comparison_summary(stocks_data: List[Dict], failed: List[str]) -> Dict:
+    """Rule-based winners per category.
+
+    FIXED: average_debt used to average `debt_to_equity or 0` over EVERY
+    stock — a stock with unknown D/E counted as zero debt and dragged the
+    average down. Unknown values are excluded now, like P/E and ROE.
+    Stocks served from the hardcoded demo dataset are also excluded from
+    the "winner" picks, so a fake number can't be crowned best value.
+    """
+    real = [s for s in stocks_data if not s.get('is_fallback_data')] or stocks_data
+
+    def pick(candidates, key, best):
+        values = [s for s in candidates if isinstance(s.get(key), (int, float))]
+        if not values:
+            return "N/A"
+        return best(values, key=lambda s: s[key])['symbol']
+
+    def average(key):
+        values = [s[key] for s in real if isinstance(s.get(key), (int, float))]
+        return round(float(np.mean(values)), 2) if values else None
+
+    positive_pe = [s for s in real if isinstance(s.get('pe_ratio'), (int, float)) and s['pe_ratio'] > 0]
+    return {
+        "ai_top_pick":   pick(real, 'ai_score', max),
+        "best_value":    pick(positive_pe, 'pe_ratio', min),
+        "best_dividend": pick(real, 'dividend_yield', max),
+        "lowest_risk":   pick(real, 'volatility', min),
+        "average_pe":    average('pe_ratio'),
+        "average_roe":   average('roe'),
+        "average_debt":  average('debt_to_equity'),
+        "failed_symbols": failed,
+    }
+
+
 @app.post("/api/compare")
 async def compare_stocks(request: CompareRequest):
     try:
-        symbols = request.symbols
-        tasks = [fetch_stock_data(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        stocks_data = []
-        failed = []
-        for i, result in enumerate(results):
-            symbol = symbols[i]
-            if isinstance(result, Exception) or not result or result[0] is None:
-                failed.append(f"{symbol}: Data unavailable")
-                stocks_data.append(get_fallback_stock_data(symbol))
-                continue
-            try:
-                stock, info, hist = result
-                stocks_data.append(build_stock_response(symbol, stock, info, hist))
-            except Exception as e:
-                failed.append(f"{symbol}: {e}")
-                stocks_data.append(get_fallback_stock_data(symbol))
-
-        valid_pe  = [s for s in stocks_data if s.get('pe_ratio')       is not None]
-        valid_roe = [s for s in stocks_data if s.get('roe')            is not None]
-        valid_div = [s for s in stocks_data if s.get('dividend_yield') is not None]
-        valid_vol = [s for s in stocks_data if s.get('volatility')     is not None]
-
-        comparison_data = {
-            "ai_top_pick":   max(stocks_data, key=lambda x: x.get('ai_score', 0))['symbol'],
-            "best_value":    min(valid_pe,  key=lambda x: x.get('pe_ratio', float('inf')))['symbol'] if valid_pe  else "N/A",
-            "best_dividend": max(valid_div, key=lambda x: x.get('dividend_yield', 0))['symbol']      if valid_div else "N/A",
-            "lowest_risk":   min(valid_vol, key=lambda x: x.get('volatility', float('inf')))['symbol'] if valid_vol else "N/A",
-            "average_pe":    round(np.mean([s['pe_ratio'] for s in valid_pe]),  2) if valid_pe  else 0,
-            "average_roe":   round(np.mean([s['roe'] for s in valid_roe]),      2) if valid_roe else 0,
-            "average_debt":  round(np.mean([s.get('debt_to_equity', 0) or 0 for s in stocks_data]), 2),
-            "failed_symbols": failed,
-        }
-        return {"stocks": stocks_data, "comparison": comparison_data}
-
+        stocks_data, failed = await _load_stocks_for_comparison(request.symbols)
+        return {"stocks": stocks_data, "comparison": _build_comparison_summary(stocks_data, failed)}
     except Exception as e:
         logger.error(f"Error comparing stocks: {e}")
         raise HTTPException(status_code=500, detail="Error comparing stocks")
 
 @app.post("/api/ai/compare")
-async def ai_compare_stocks(request: CompareRequest, req: Request = None):
+async def ai_compare_stocks(request: CompareRequest, req: Request):
+    """FIXED: this is the endpoint the frontend actually calls for every
+    comparison, but it never returned the `comparison` summary block. The
+    Compare page therefore always took its "AI" branch and the whole
+    metrics table (price, P/E, ROE, D/E, market cap, averages) was dead
+    code that could never render. Both are returned now and the page shows
+    both."""
     try:
-        symbols = request.symbols
-        user_id = req.client.host if req and req.client else "anonymous"
-        tasks = [fetch_stock_data(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        stocks_data = []
-        failed = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception) or not result or result[0] is None:
-                failed.append(symbols[i])
-                stocks_data.append(get_fallback_stock_data(symbols[i]))
-                continue
-            stock, info, hist = result
-            try:
-                stocks_data.append(build_stock_response(symbols[i], stock, info, hist))
-            except Exception:
-                stocks_data.append(get_fallback_stock_data(symbols[i]))
-
+        user_id = get_client_ip(req)
+        stocks_data, failed = await _load_stocks_for_comparison(request.symbols)
         ai_analysis = await ai_service.analyze_stock_comparison(stocks_data, user_id=user_id)
         return {
             "success": True,
             "stocks": stocks_data,
+            "comparison": _build_comparison_summary(stocks_data, failed),
             "ai_analysis": ai_analysis,
             "failed_symbols": failed,
             "rate_limit": ai_service.get_rate_limit_stats(),
@@ -2022,17 +2323,16 @@ async def ai_compare_stocks(request: CompareRequest, req: Request = None):
         return {"success": False, "error": str(e)}
 
 @app.get("/api/ai/thesis/{symbol}")
-async def get_ai_thesis(symbol: str, req: Request = None):
+async def get_ai_thesis(symbol: str, req: Request):
     try:
         symbol = symbol.upper().strip()
-        user_id = req.client.host if req and req.client else "anonymous"
-        result = await fetch_stock_data(symbol)
+        user_id = get_client_ip(req)
+        result, news = await asyncio.gather(fetch_stock_data(symbol), fetch_news_async(symbol))
         if result and result[0] is not None and result[2] is not None:
             stock, info, hist = result
-            stock_data = build_stock_response(symbol, stock, info, hist)
+            stock_data = build_stock_response(symbol, stock, info, hist, news)
         else:
             stock_data = get_fallback_stock_data(symbol)
-        news = get_latest_news(symbol)
         thesis = await ai_service.generate_investment_thesis(stock_data, news, user_id=user_id)
         return {"success": True, "symbol": symbol, "thesis": thesis, "timestamp": datetime.now().isoformat()}
     except Exception as e:
@@ -2040,18 +2340,19 @@ async def get_ai_thesis(symbol: str, req: Request = None):
         return {"success": False, "error": str(e)}
 
 @app.post("/api/ai/question")
-async def ask_ai_question(request: dict, req: Request = None):
+async def ask_ai_question(request: dict, req: Request):
     try:
         question = request.get("question")
         symbol   = request.get("symbol")
-        user_id  = req.client.host if req and req.client else "anonymous"
+        user_id  = get_client_ip(req)
         if not question:
             return {"success": False, "error": "Question is required"}
         stock_data = None
         if symbol:
+            symbol = str(symbol).upper().strip()
             try:
                 result = await fetch_stock_data(symbol)
-                if result and result[0] is not None:
+                if result and result[0] is not None and result[2] is not None:
                     stock, info, hist = result
                     stock_data = build_stock_response(symbol, stock, info, hist)
                 else:
@@ -2065,13 +2366,14 @@ async def ask_ai_question(request: dict, req: Request = None):
         return {"success": False, "error": str(e)}
 
 @app.post("/api/ai/sentiment")
-async def analyze_sentiment(request: dict, req: Request = None):
+async def analyze_sentiment(request: dict, req: Request):
     try:
-        symbols = request.get("symbols", [])
-        user_id = req.client.host if req and req.client else "anonymous"
+        symbols = [str(s).upper().strip() for s in (request.get("symbols") or [])][:config.MAX_COMPARISON_STOCKS]
+        user_id = get_client_ip(req)
         if not symbols:
             return {"success": False, "error": "Symbols required"}
-        news_data = {symbol: get_latest_news(symbol, max_news=3) for symbol in symbols}
+        news_lists = await asyncio.gather(*[fetch_news_async(s, max_news=3) for s in symbols])
+        news_data = dict(zip(symbols, news_lists))
         sentiment = await ai_service.get_market_sentiment(symbols, news_data, user_id=user_id)
         return {"success": True, "sentiment": sentiment, "timestamp": datetime.now().isoformat()}
     except Exception as e:
@@ -2113,18 +2415,28 @@ async def get_trending(use_cache: bool = True):
     symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META']
 
     async def fetch_trending(symbol):
+        # FIXED (2 bugs):
+        # 1. get_company_info() returns yFinance's camelCase schema
+        #    (longName, marketCap) since the schema-mapping fix, but this
+        #    still read 'company_name' / 'market_cap' — so every trending
+        #    stock showed its ticker as its name and a market cap of 0.
+        # 2. get_company_info() also spent an Alpha Vantage call per symbol:
+        #    7 of the 25 daily calls gone on every uncached page load, just
+        #    for display names. get_company_identity() uses Finnhub only.
         try:
-            quote = await hybrid_engine.get_quote(symbol)
-            company_info = await hybrid_engine.get_company_info(symbol)
-            
+            quote, identity = await asyncio.gather(
+                hybrid_engine.get_quote(symbol),
+                hybrid_engine.get_company_identity(symbol),
+            )
+
             if quote and quote.get('price'):
                 return {
                     "symbol": symbol,
-                    "name": company_info.get('company_name', symbol) if company_info else symbol,
+                    "name": identity.get('longName') or identity.get('shortName') or symbol,
                     "price": quote.get('price', 0),
                     "change": quote.get('change_percent', 0),
                     "volume": quote.get('volume', 0),
-                    "market_cap": company_info.get('market_cap', 0) if company_info else 0,
+                    "market_cap": identity.get('marketCap', 0) or 0,
                     "source": quote.get('source', 'unknown')
                 }
         except Exception as e:
@@ -2201,7 +2513,7 @@ async def debug_stock(symbol: str):
         result["tests"].append({
             "name": "hybrid_company",
             "success": bool(info),
-            "company": info.get('company_name') if info else None
+            "company": (info.get('longName') or info.get('shortName')) if info else None
         })
         
         return result

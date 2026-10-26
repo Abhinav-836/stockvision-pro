@@ -22,12 +22,19 @@ function setCached(key, data) {
   cache.set(key, { data, timestamp: Date.now() });
 }
 
+// FIXED: every failure was retried 3 times with backoff — including 4xx
+// responses like 422 "Invalid symbol" or 429 "Rate limit exceeded", which
+// will fail identically every time. A typo took several seconds to show
+// its error, and retrying a 429 made the rate limiting worse. Only network
+// errors, timeouts and 5xx are retried now.
 async function fetchWithRetry(url, options = {}, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fetchAPI(url, options);
     } catch (error) {
-      if (i === retries - 1) throw error;
+      const status = error.status;
+      const retryable = status === undefined || status >= 500;
+      if (!retryable || i === retries - 1) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
   }
@@ -66,11 +73,20 @@ async function fetchAPI(endpoint, options = {}) {
       let errorMessage = `HTTP ${response.status}`;
       try {
         const errorData = await response.json();
-        errorMessage = errorData.detail || errorData.message || errorMessage;
+        const detail = errorData.detail;
+        // FastAPI validation errors put an ARRAY in `detail`; showing it
+        // directly rendered "[object Object]" in the error banner.
+        if (Array.isArray(detail)) {
+          errorMessage = detail.map(d => d.msg || String(d)).join('; ');
+        } else {
+          errorMessage = detail || errorData.error || errorData.message || errorMessage;
+        }
       } catch {
         errorMessage = response.statusText || errorMessage;
       }
-      throw new Error(errorMessage);
+      const httpError = new Error(errorMessage);
+      httpError.status = response.status;
+      throw httpError;
     }
 
     return await response.json();
@@ -156,7 +172,11 @@ export async function compareStocks(symbols, useCache = true) {
     throw new Error('Duplicate symbols detected');
   }
 
-  const cacheKey = `compare:${cleanSymbols.sort().join(',')}`;
+  // FIXED: cleanSymbols.sort() sorted the array IN PLACE, so the request
+  // body was sent alphabetically and the comparison table's columns came
+  // back in a different order than the user typed them ("Primary" stock
+  // was no longer first). Sort a copy for the cache key only.
+  const cacheKey = `compare:${[...cleanSymbols].sort().join(',')}`;
   if (useCache) {
     const cached = getCached(cacheKey);
     if (cached) return cached;

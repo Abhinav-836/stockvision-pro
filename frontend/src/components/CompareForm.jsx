@@ -11,7 +11,6 @@ function CompareForm() {
   const [error, setError] = useState('');
   const [chartData, setChartData] = useState({});
   const [chartPeriod, setChartPeriod] = useState('3mo');
-  const [comparisonType, setComparisonType] = useState('standard'); // 'standard' or 'ai'
 
   const periods = [
     { value: '1d', label: '1D' },
@@ -21,6 +20,12 @@ function CompareForm() {
     { value: '6mo', label: '6M' },
     { value: '1y', label: '1Y' },
   ];
+
+  const isNum = (v) => typeof v === 'number' && isFinite(v);
+  const fmt = (v, { prefix = '', suffix = '', digits = 2 } = {}) =>
+    isNum(v) ? `${prefix}${v.toFixed(digits)}${suffix}` : 'N/A';
+  // Indian stocks are priced in rupees, not dollars.
+  const cur = (stock) => (stock?.is_indian_stock ? '₹' : '$');
 
   const handleAddSymbol = () => {
     if (symbols.length < 5) {
@@ -39,7 +44,12 @@ function CompareForm() {
 
   const handleSymbolChange = (index, value) => {
     const newSymbols = [...symbols];
-    newSymbols[index] = value.toUpperCase().replace(/[^A-Z.]/g, '').slice(0, 10);
+    // FIXED: the old filter /[^A-Z.]/ + slice(0, 10) stripped digits and
+    // hyphens and cut symbols at 10 characters — so HDFCBANK.NS became
+    // "HDFCBANK.N", ICICIBANK.NS became "ICICIBANK.", BRK-B became "BRKB",
+    // and BAJAJ-AUTO.NS was impossible to type. All of them then failed
+    // backend validation. Digits, "-" and "&" (M&M.NS) are allowed now.
+    newSymbols[index] = value.toUpperCase().replace(/[^A-Z0-9.&-]/g, '').slice(0, 20);
     setSymbols(newSymbols);
     setError('');
     setData(null);
@@ -48,7 +58,7 @@ function CompareForm() {
   };
 
   const validateSymbols = () => {
-    const valid = symbols.filter(s => s.trim());
+    const valid = symbols.map(s => s.trim()).filter(Boolean);
     if (valid.length < 2) {
       setError('Please enter at least 2 symbols');
       return null;
@@ -82,7 +92,7 @@ function CompareForm() {
 
   const handlePeriodChange = async (period) => {
     setChartPeriod(period);
-    const valid = symbols.filter(s => s.trim());
+    const valid = symbols.map(s => s.trim()).filter(Boolean);
     if (valid.length >= 2) {
       await fetchChartData(valid, period);
     }
@@ -99,15 +109,18 @@ function CompareForm() {
 
     try {
       const result = await compareStocks(valid);
-      setData(result);
-      
-      // Extract AI analysis if available
-      if (result.ai_analysis) {
-        setAiData(result.ai_analysis);
-        setComparisonType('ai');
-      } else {
-        setComparisonType('standard');
+      // /api/ai/compare reports failures as {success: false, error} with
+      // HTTP 200 — surface that instead of rendering an empty page.
+      if (result && result.success === false) {
+        throw new Error(result.error || 'Comparison failed');
       }
+      setData(result);
+
+      // FIXED: the endpoint always returns ai_analysis (it has a rule-based
+      // fallback when the AI is unavailable), so the old
+      // comparisonType === 'standard' branch could never be reached and
+      // the metrics table below never rendered. Both sections render now.
+      setAiData(result.ai_analysis || null);
       
       await fetchChartData(valid);
     } catch (err) {
@@ -225,7 +238,7 @@ function CompareForm() {
       )}
 
       {/* AI Analysis Results */}
-      {aiData && comparisonType === 'ai' && (
+      {aiData && (
         <div className="ai-analysis-card glass-card">
           <div className="ai-analysis-header">
             <i className="fas fa-brain"></i>
@@ -271,10 +284,19 @@ function CompareForm() {
         </div>
       )}
 
-      {/* Standard Comparison Results */}
-      {data && data.stocks && comparisonType === 'standard' && (
+      {/* Comparison Results */}
+      {data && data.stocks && (
         <div className="comparison-results">
+          {Array.isArray(data.failed_symbols) && data.failed_symbols.length > 0 && (
+            <div className="connection-warning">
+              <i className="fas fa-exclamation-triangle"></i>
+              <span>
+                Live data unavailable for {data.failed_symbols.join(', ')} — showing last known or estimated values
+              </span>
+            </div>
+          )}
           {/* Summary Cards */}
+          {data.comparison && (
           <div className="comparison-summary">
             <div className="summary-card ai-pick">
               <div className="summary-label">AI Top Pick</div>
@@ -293,6 +315,7 @@ function CompareForm() {
               <div className="summary-value">{data.comparison.lowest_risk}</div>
             </div>
           </div>
+          )}
 
           {/* Comparison Table */}
           <div className="comparison-table-wrapper">
@@ -315,14 +338,14 @@ function CompareForm() {
                 <tr>
                   <td>Price</td>
                   {data.stocks.map(stock => (
-                    <td key={stock.symbol}>${stock.current_price?.toFixed(2)}</td>
+                    <td key={stock.symbol}>{fmt(stock.current_price, { prefix: cur(stock) })}</td>
                   ))}
                 </tr>
                 <tr>
                   <td>Change %</td>
                   {data.stocks.map(stock => (
                     <td key={stock.symbol} className={stock.change_percent >= 0 ? 'positive' : 'negative'}>
-                      {stock.change_percent >= 0 ? '+' : ''}{stock.change_percent?.toFixed(2)}%
+                      {stock.change_percent >= 0 ? '+' : ''}{fmt(stock.change_percent, { suffix: '%' })}
                     </td>
                   ))}
                 </tr>
@@ -342,32 +365,32 @@ function CompareForm() {
                 <tr>
                   <td>P/E Ratio</td>
                   {data.stocks.map(stock => (
-                    <td key={stock.symbol}>{stock.pe_ratio || 'N/A'}</td>
+                    <td key={stock.symbol}>{fmt(stock.pe_ratio)}</td>
                   ))}
                 </tr>
                 <tr>
                   <td>Dividend Yield</td>
                   {data.stocks.map(stock => (
-                    <td key={stock.symbol}>{stock.dividend_yield ? `${stock.dividend_yield}%` : 'N/A'}</td>
+                    <td key={stock.symbol}>{fmt(stock.dividend_yield, { suffix: '%' })}</td>
                   ))}
                 </tr>
                 <tr>
                   <td>ROE</td>
                   {data.stocks.map(stock => (
-                    <td key={stock.symbol}>{stock.roe ? `${stock.roe}%` : 'N/A'}</td>
+                    <td key={stock.symbol}>{fmt(stock.roe, { suffix: '%' })}</td>
                   ))}
                 </tr>
                 <tr>
                   <td>Debt/Equity</td>
                   {data.stocks.map(stock => (
-                    <td key={stock.symbol}>{stock.debt_to_equity ?? 'N/A'}</td>
+                    <td key={stock.symbol}>{fmt(stock.debt_to_equity)}</td>
                   ))}
                 </tr>
                 <tr>
                   <td>Market Cap</td>
                   {data.stocks.map(stock => (
                     <td key={stock.symbol}>
-                      {stock.market_cap ? `$${(stock.market_cap / 1e9).toFixed(2)}B` : 'N/A'}
+                      {stock.market_cap ? `${cur(stock)}${(stock.market_cap / 1e9).toFixed(2)}B` : 'N/A'}
                     </td>
                   ))}
                 </tr>
@@ -376,20 +399,21 @@ function CompareForm() {
           </div>
 
           {/* Average Metrics */}
+          {data.comparison && (
           <div className="comparison-average">
             <h4 className="average-title">Average Metrics</h4>
             <div className="average-grid">
               <div className="average-item">
                 <div className="average-label">Avg P/E</div>
-                <div className="average-value">{data.comparison.average_pe}</div>
+                <div className="average-value">{fmt(data.comparison.average_pe)}</div>
               </div>
               <div className="average-item">
                 <div className="average-label">Avg ROE</div>
-                <div className="average-value">{data.comparison.average_roe}%</div>
+                <div className="average-value">{fmt(data.comparison.average_roe, { suffix: '%' })}</div>
               </div>
               <div className="average-item">
                 <div className="average-label">Avg Debt/Equity</div>
-                <div className="average-value">{data.comparison.average_debt}</div>
+                <div className="average-value">{fmt(data.comparison.average_debt)}</div>
               </div>
               <div className="average-item">
                 <div className="average-label">Stocks</div>
@@ -397,6 +421,7 @@ function CompareForm() {
               </div>
             </div>
           </div>
+          )}
         </div>
       )}
     </div>
