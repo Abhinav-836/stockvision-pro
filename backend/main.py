@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import yfinance as yf
 import numpy as np
 import asyncio
@@ -725,12 +725,12 @@ class HybridDataEngine:
                 "outputsize": "compact",
                 "apikey": self.av_api_key
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.av_base_url, params=params, timeout=12) as response:
                     data = await response.json()
                     self._record_av_call()
-                    
+
                     if "Error Message" in data:
                         logger.warning(f"Alpha Vantage historical rejected for {symbol}: {_redact_secrets(data.get('Error Message'))}")
                         return None
@@ -741,7 +741,7 @@ class HybridDataEngine:
                         self._note_av_rejection("TIME_SERIES_DAILY", data.get('Information'))
                         logger.warning(f"Alpha Vantage historical rejected for {symbol}: {_redact_secrets(data.get('Information'))}")
                         return None
-                    
+
                     time_series = data.get("Time Series (Daily)", {})
                     if time_series:
                         cutoff = (datetime.now() - timedelta(days=self.PERIOD_DAYS.get(period, 31))).strftime("%Y-%m-%d")
@@ -761,7 +761,7 @@ class HybridDataEngine:
                                 })
                             except:
                                 continue
-                        
+
                         if result:
                             self.av_success += 1
                             return result
@@ -1429,6 +1429,7 @@ class LRUCache:
         self.hits = 0
         self.misses = 0
 
+    
     def get(self, key):
         if key not in self.cache:
             self.misses += 1
@@ -2063,7 +2064,7 @@ def calculate_price_metrics(info: Dict, hist) -> Dict:
 news_cache = LRUCache(max_size=500, ttl=900)
 
 
-async def fetch_news_async(symbol: str, max_news: int = 5) -> List[Dict]:
+async def fetch_news_async(symbol: str, max_news: int = 5, company_name: Optional[str] = None) -> List[Dict]:
     """Non-blocking, timeout-bounded, cached news fetch.
 
     FIXED: build_stock_response() used to call get_latest_news() directly.
@@ -2098,9 +2099,18 @@ async def fetch_news_async(symbol: str, max_news: int = 5) -> List[Dict]:
     # (through the proxy) without raising, so news was always []. US
     # symbols now fall back to Finnhub's company-news endpoint, which is
     # on the free plan. Finnhub has no NSE/BSE coverage, so Indian symbols
-    # only get yFinance news.
+    # skip it and go to Google News below.
     if not news and not is_indian_stock(symbol):
         news = await _fetch_finnhub_news(symbol, max_news)
+
+    # Last resort for every symbol, and the ONLY working source for NSE/BSE
+    # symbols: production logs showed Yahoo returning zero news items for
+    # .NS tickers and Finnhub has no Indian coverage, so Indian stocks
+    # always showed an empty news section. Google News RSS is free, needs
+    # no API key, and covers Indian business outlets (ET, Moneycontrol,
+    # Business Standard, Mint...).
+    if not news:
+        news = await _fetch_google_news(symbol, max_news, company_name)
 
     # FIXED: an empty result used to be cached for the full 15 minutes, so
     # one failed fetch hid news for that symbol for a quarter of an hour.
@@ -2129,7 +2139,7 @@ async def _fetch_finnhub_news(symbol: str, max_news: int) -> List[Dict]:
     except Exception as e:
         logger.warning(f"Finnhub news error for {symbol}: {type(e).__name__}: {e}")
         return []
-
+        
     items: List[Dict] = []
     for item in raw or []:
         title = (item.get("headline") or "").strip()
@@ -2149,6 +2159,139 @@ async def _fetch_finnhub_news(symbol: str, max_news: int) -> List[Dict]:
         if len(items) >= max_news:
             break
     return items
+
+
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+_SOCIAL_SOURCES = {"facebook", "instagram", "x", "twitter", "linkedin", "youtube", "threads", "reddit"}
+
+
+_COMPANY_SUFFIXES = re.compile(r'[\s,.]+(limited|ltd|inc|incorporated|corporation|corp|plc|co)\.?$', re.IGNORECASE)
+
+
+def _clean_company_name(name: Optional[str]) -> Optional[str]:
+    """'Reliance Industries Limited' -> 'Reliance Industries'."""
+    if not name:
+        return None
+    cleaned = _COMPANY_SUFFIXES.sub("", name.strip()).strip()
+    return cleaned if len(cleaned) >= 3 else None
+
+
+def _google_news_query(symbol: str, company_name: Optional[str] = None) -> Dict[str, str]:
+    """Search parameters for a symbol.
+
+    The exact company name is used when it's known. Searching by ticker
+    alone ("RELIANCE share NSE") was checked against the live feed and
+    returned Reliance Power, Reliance Infra and Reliance Home Finance
+    alongside Reliance Industries; "\"Reliance Industries\"" doesn't.
+    Indian symbols search Google's Indian edition."""
+    name = _clean_company_name(company_name)
+    if is_indian_stock(symbol):
+        base = normalize_indian_symbol(symbol).upper()
+        exchange = "BSE" if symbol.upper().endswith((".BO", ".BSE")) else "NSE"
+        query = f'"{name}" when:7d' if name else f"{base} share {exchange} when:7d"
+        return {"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
+    query = f'"{name}" stock when:7d' if name else f"{symbol.upper()} stock when:7d"
+    return {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+
+
+def parse_google_news_rss(xml_text: str, max_news: int) -> List[Dict]:
+    """Parse Google News RSS into the app's {title, publisher, link,
+    published} news shape. Google appends " - Publisher" to every title;
+    that suffix is stripped because the publisher has its own field."""
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        logger.warning("Google News returned invalid RSS")
+        return []
+
+    items: List[Dict] = []
+    seen_titles = set()
+    # Google ranks by relevance, not date, and the top results for a stock
+    # are mostly evergreen quote pages ("Reliance Industries Share Price -
+    # Live NSE: RELIANCE Stock Price & Chart - Upstox"), not news. Those
+    # are dropped, and what's left is sorted newest-first below.
+    quote_page = re.compile(
+        r"share price (today|live)|stock price (today|live|&)|price,? quote|"
+        r"live (nse|bse)|share price\s*$|stock price\s*$|price & chart",
+        re.IGNORECASE,
+    )
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        publisher = (item.findtext("source") or "").strip()
+        if publisher and title.endswith(f" - {publisher}"):
+            title = title[: -len(f" - {publisher}")].strip()
+        if not title or title.lower() in seen_titles or quote_page.search(title):
+            continue
+        # Companies' own social posts show up as "news" (checked against the
+        # live feed: Reliance's Facebook posts were among the newest items).
+        if publisher.lower() in _SOCIAL_SOURCES:
+            continue
+        seen_titles.add(title.lower())
+
+        published = None
+        pub_date = item.findtext("pubDate")
+        if pub_date:
+            try:
+                dt = parsedate_to_datetime(pub_date)
+                # Naive UTC, like the yFinance and Finnhub news timestamps.
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                published = dt.isoformat()
+            except (TypeError, ValueError):
+                published = None
+
+        items.append({
+            "title": title,
+            "publisher": publisher or "Google News",
+            "link": (item.findtext("link") or "").strip(),
+            "published": published,
+        })
+    items.sort(key=lambda i: i["published"] or "", reverse=True)
+    return items[:max_news]
+
+
+async def _fetch_google_news(symbol: str, max_news: int, company_name: Optional[str] = None) -> List[Dict]:
+    """Recent headlines from Google News RSS (no API key). Called directly,
+    not through YFINANCE_PROXY_URL — Google doesn't block cloud IPs for
+    RSS, so there's no reason to spend proxy bandwidth on it."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        headers = {"User-Agent": NSEDataProvider.HEADERS["User-Agent"]}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(GOOGLE_NEWS_RSS, params=_google_news_query(symbol, company_name)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Google News HTTP {resp.status} for {symbol}")
+                    return []
+                text = await resp.text()
+    except Exception as e:
+        logger.warning(f"Google News error for {symbol}: {type(e).__name__}: {e}")
+        return []
+
+    items = parse_google_news_rss(text, max_news)
+    if not items:
+        logger.info(f"Google News returned no headlines for {symbol}")
+    return items
+
+
+async def fetch_stock_and_news(symbol: str, use_cache: bool = True, max_news: int = 5):
+    """Stock data plus news. US symbols fetch both in parallel (their news
+    comes from Finnhub by ticker). Indian symbols fetch the stock first so
+    Google News can be searched by the company's name — the only news
+    source that works for NSE/BSE, and inaccurate when searched by ticker."""
+    if not is_indian_stock(symbol):
+        result, news = await asyncio.gather(
+            fetch_stock_data(symbol, use_cache=use_cache),
+            fetch_news_async(symbol, max_news),
+        )
+        return result, news
+    result = await fetch_stock_data(symbol, use_cache=use_cache)
+    info = result[1] if result and isinstance(result[1], dict) else {}
+    name = info.get("longName") or info.get("shortName")
+    news = await fetch_news_async(symbol, max_news, company_name=name)
+    return result, news
 
 
 def build_stock_response(symbol: str, stock, info: Dict, hist, news: Optional[List[Dict]] = None) -> Dict:
@@ -2262,10 +2405,7 @@ async def get_stock_analysis(symbol: str, use_cache: bool = True):
             if cached:
                 return cached
 
-        result, news = await asyncio.gather(
-            fetch_stock_data(symbol, use_cache=False),
-            fetch_news_async(symbol),
-        )
+        result, news = await fetch_stock_and_news(symbol, use_cache=False)
         if result and result[0] is not None and result[2] is not None:
             stock, info, hist = result
             response_data = build_stock_response(symbol, stock, info, hist, news)
@@ -2412,13 +2552,11 @@ async def _load_stocks_for_comparison(symbols: List[str]):
     last-known-good fallback as /api/stock/{symbol}, so a transient outage
     shows slightly stale REAL data instead of the hardcoded demo dataset.
     """
-    results, news_lists = await asyncio.gather(
-        asyncio.gather(*[fetch_stock_data(s) for s in symbols], return_exceptions=True),
-        asyncio.gather(*[fetch_news_async(s) for s in symbols]),
-    )
+    pairs = await asyncio.gather(*[fetch_stock_and_news(s) for s in symbols], return_exceptions=True)
     stocks_data: List[Dict] = []
     failed: List[str] = []
-    for symbol, result, news in zip(symbols, results, news_lists):
+    for symbol, pair in zip(symbols, pairs):
+        result, news = pair if not isinstance(pair, Exception) else (pair, [])
         built = None
         if not isinstance(result, Exception) and result and result[0] is not None and result[2] is not None:
             try:
@@ -2509,7 +2647,7 @@ async def get_ai_thesis(symbol: str, req: Request):
     try:
         symbol = symbol.upper().strip()
         user_id = get_client_ip(req)
-        result, news = await asyncio.gather(fetch_stock_data(symbol), fetch_news_async(symbol))
+        result, news = await fetch_stock_and_news(symbol)
         if result and result[0] is not None and result[2] is not None:
             stock, info, hist = result
             stock_data = build_stock_response(symbol, stock, info, hist, news)
