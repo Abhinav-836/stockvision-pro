@@ -166,6 +166,55 @@ class NSEDataProvider:
         self._lock = asyncio.Lock()
         self.calls = 0
         self.success = 0
+        # FIXED: production logs showed NSE answering Render with HTTP 403
+        # (quote) and an HTML block page instead of JSON (historical) —
+        # NSE's Akamai bot protection rejects datacenter IPs outright, the
+        # same way Yahoo does. Requests can now go through a proxy:
+        # NSE_PROXY_URL if set, otherwise the same YFINANCE_PROXY_URL that
+        # already gets yFinance past Yahoo's block.
+        self.proxy = os.getenv("NSE_PROXY_URL") or os.getenv("YFINANCE_PROXY_URL") or None
+        # Circuit breaker: when NSE is blocking us, every Indian lookup was
+        # paying ~2s of doomed NSE round-trips before falling back to
+        # yFinance. After 3 consecutive blocks, skip NSE for 10 minutes.
+        self._consecutive_blocks = 0
+        self._blocked_until = 0.0
+
+    def is_blocked(self) -> bool:
+        return time.time() < self._blocked_until
+
+    def _record_block(self, reason: str):
+        self._consecutive_blocks += 1
+        self._cookies_ts = 0.0  # force a fresh cookie bootstrap next time
+        if self._consecutive_blocks >= 3:
+            self._blocked_until = time.time() + 600
+            logger.warning(
+                f"NSE blocked {self._consecutive_blocks} times in a row ({reason}) — "
+                f"skipping NSE for 10 minutes, Indian data will come from yFinance"
+            )
+
+    def _record_ok(self):
+        self._consecutive_blocks = 0
+        self._blocked_until = 0.0
+
+    async def _get_json(self, session: aiohttp.ClientSession, url: str, timeout: int, label: str):
+        """GET a JSON endpoint; returns parsed JSON or None. NSE serves an
+        HTML bot-check page (HTTP 200) when it blocks a client, which used
+        to surface as a confusing "JSONDecodeError: Expecting value"."""
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), proxy=self.proxy) as resp:
+            if resp.status != 200:
+                logger.warning(f"NSE {label} HTTP {resp.status}")
+                if resp.status in (401, 403):
+                    self._record_block(f"HTTP {resp.status}")
+                return None
+            body = await resp.text()
+        try:
+            data = json.loads(body)
+        except ValueError:
+            logger.warning(f"NSE {label} returned non-JSON (bot-check page) — treating as blocked")
+            self._record_block("non-JSON response")
+            return None
+        self._record_ok()
+        return data
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -182,7 +231,7 @@ class NSEDataProvider:
                 return
             session = await self._get_session()
             try:
-                async with session.get(self.BASE, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.get(self.BASE, timeout=aiohttp.ClientTimeout(total=8), proxy=self.proxy) as resp:
                     await resp.read()
                 self._cookies_ts = time.time()
             except Exception as e:
@@ -190,20 +239,18 @@ class NSEDataProvider:
 
     async def get_quote(self, symbol: str) -> Optional[Dict]:
         """symbol WITHOUT the .NS/.BO suffix, e.g. 'RELIANCE'."""
+        if self.is_blocked():
+            return None
         try:
             await self._ensure_cookies()
             session = await self._get_session()
             self.calls += 1
             url = f"{self.BASE}/api/quote-equity?symbol={symbol}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    # FIXED: non-200s used to return None silently, so a
-                    # blocked/expired NSE session was invisible in the logs.
-                    logger.warning(f"NSE quote HTTP {resp.status} for {symbol}")
-                    if resp.status in (401, 403):
-                        self._cookies_ts = 0.0  # force a fresh cookie bootstrap next time
-                    return None
-                data = await resp.json(content_type=None)
+            # FIXED: non-200s used to return None silently, so a
+            # blocked/expired NSE session was invisible in the logs.
+            data = await self._get_json(session, url, 8, f"quote for {symbol}")
+            if not data:
+                return None
 
             price_info = data.get("priceInfo", {}) or {}
             last_price = price_info.get("lastPrice")
@@ -240,6 +287,8 @@ class NSEDataProvider:
         days = days_map.get(period, 32)
         end = datetime.now()
         start = end - timedelta(days=days)
+        if self.is_blocked():
+            return None
         try:
             await self._ensure_cookies()
             session = await self._get_session()
@@ -248,13 +297,9 @@ class NSEDataProvider:
                 f"{self.BASE}/api/historical/cm/equity?symbol={symbol}"
                 f"&series=[%22EQ%22]&from={start.strftime('%d-%m-%Y')}&to={end.strftime('%d-%m-%Y')}"
             )
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"NSE historical HTTP {resp.status} for {symbol}")
-                    if resp.status in (401, 403):
-                        self._cookies_ts = 0.0
-                    return None
-                data = await resp.json(content_type=None)
+            data = await self._get_json(session, url, 10, f"historical for {symbol}")
+            if not data:
+                return None
 
             rows = data.get("data", [])
             if not rows:
@@ -284,14 +329,15 @@ class NSEDataProvider:
         """NSE's quote payload has identity/trade fields and P/E, but not
         ROE/debt-to-equity/EPS etc — those still come from AV/yFinance.
         Returned in yFinance's camelCase schema so it merges cleanly."""
+        if self.is_blocked():
+            return None
         try:
             await self._ensure_cookies()
             session = await self._get_session()
             url = f"{self.BASE}/api/quote-equity?symbol={symbol}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
+            data = await self._get_json(session, url, 8, f"company info for {symbol}")
+            if not data:
+                return None
 
             info_block = data.get("info", {}) or {}
             metadata = data.get("metadata", {}) or {}
@@ -365,6 +411,12 @@ class HybridDataEngine:
         # firing requests at AV long after the real quota was gone,
         # burning time on calls that were guaranteed to be rejected.
         self.av_daily_limit = int(os.getenv("ALPHA_VANTAGE_DAILY_LIMIT", 25))
+        # AV functions this key isn't entitled to. Production logs showed
+        # OVERVIEW coming back as "This is a premium endpoint" on the free
+        # key — retrying it on every lookup burned 1 of 25 daily calls each
+        # time for a guaranteed rejection. Once AV says a function is
+        # premium, it's skipped for the rest of the process.
+        self.av_premium_functions: set = set()
 
         # Cache (optimized with shorter TTL for real-time)
         self.cache = {}
@@ -568,6 +620,16 @@ class HybridDataEngine:
         self.av_calls_day = [t for t in self.av_calls_day if t >= self.av_day_reset.timestamp()]
         return len(self.av_calls_day) < self.av_daily_limit
     
+    def _note_av_rejection(self, function: str, message) -> None:
+        """Handle an AV "Information" rejection: premium-only function,
+        or the per-key daily limit."""
+        text = str(message or "")
+        if "premium" in text.lower():
+            if function not in self.av_premium_functions:
+                self.av_premium_functions.add(function)
+                logger.warning(f"Alpha Vantage {function} is premium-only for this key — not calling it again this session")
+        self._note_av_daily_limit(text)
+
     def _note_av_daily_limit(self, message) -> None:
         """AV's own counter is per KEY, not per server process: calls from
         local testing, other projects or earlier deploys today all count.
@@ -653,7 +715,7 @@ class HybridDataEngine:
         3. The period was ignored — "1mo" returned 100 trading days
            (~5 months), so the 1M chart showed five months of data.
         """
-        if not self.av_enabled or not self._can_call_av():
+        if not self.av_enabled or "TIME_SERIES_DAILY" in self.av_premium_functions or not self._can_call_av():
             return None
 
         try:
@@ -676,7 +738,7 @@ class HybridDataEngine:
                         logger.warning(f"Alpha Vantage historical rate-limited for {symbol}: {_redact_secrets(data.get('Note'))}")
                         return None
                     if "Information" in data:
-                        self._note_av_daily_limit(data.get('Information'))
+                        self._note_av_rejection("TIME_SERIES_DAILY", data.get('Information'))
                         logger.warning(f"Alpha Vantage historical rejected for {symbol}: {_redact_secrets(data.get('Information'))}")
                         return None
                     
@@ -709,7 +771,7 @@ class HybridDataEngine:
     
     async def _fetch_av_company_info(self, symbol: str) -> Optional[Dict]:
         """Fetch company overview from Alpha Vantage (BEST FUNDAMENTALS)"""
-        if not self.av_enabled or not self._can_call_av():
+        if not self.av_enabled or "OVERVIEW" in self.av_premium_functions or not self._can_call_av():
             return None
         
         try:
@@ -725,7 +787,7 @@ class HybridDataEngine:
                     self._record_av_call()
                     
                     if isinstance(data, dict) and "Information" in data:
-                        self._note_av_daily_limit(data.get("Information"))
+                        self._note_av_rejection("OVERVIEW", data.get("Information"))
                         logger.warning(f"Alpha Vantage overview rejected for {symbol}: {_redact_secrets(data.get('Information'))}")
                         return None
                     if data and "Symbol" in data:
@@ -1128,7 +1190,11 @@ class HybridDataEngine:
         results = []
         for symbol in symbols:
             try:
-                quote = await self._fetch_fh_quote(symbol)
+                # FIXED: Finnhub's free plan has none of these symbols
+                # (^GSPC, GC=F, BTC-USD...): every 5-minute ticker refresh
+                # spent 10 of the 60 calls/minute on guaranteed misses.
+                is_index_like = symbol.startswith('^') or '=' in symbol or symbol.endswith('-USD')
+                quote = None if is_index_like else await self._fetch_fh_quote(symbol)
                 if quote:
                     result = {
                         "symbol": symbol,
