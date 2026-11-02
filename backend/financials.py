@@ -715,13 +715,16 @@ def calculate_ai_score(metrics: Dict) -> float:
     # --- Risk / volatility (10 pts) ----------------------------------------
     vol = metrics.get('volatility')
     if isinstance(vol, (int, float)):
-        if vol < 0.3:
+        # Market volatility is usually ~15-20%, so low-variance stocks get a
+        # bigger score and a volatility reading above 50% becomes a meaningful
+        # risk drag.
+        if vol < 0.2:
             score += 10
-        elif vol < 0.5:
+        elif vol < 0.35:
             score += 8
-        elif vol < 0.8:
+        elif vol < 0.55:
             score += 6
-        elif vol < 1.2:
+        elif vol < 0.8:
             score += 4
         else:
             score += 2
