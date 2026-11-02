@@ -54,14 +54,29 @@ class OpenRouterAIService:
     def __init__(self):
         self.api_key  = os.getenv("OPENROUTER_API_KEY")
         self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        # FIXED: meta-llama/llama-3.3-70b-instruct:free was retired on
-        # OpenRouter, so every AI call failed and the app silently fell back
-        # to its rule-based placeholder text.
-        self.model    = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
-        # gpt-oss is a reasoning model: it "thinks" before answering, and
+        # FIXED: the previous defaults (meta-llama/llama-3.3-70b-instruct:free,
+        # then openai/gpt-oss-120b:free, then google/gemma-4-31b-it:free) were
+        # all removed from or throttled on OpenRouter's free tier, so every AI
+        # call failed and the app silently fell back to its rule-based
+        # placeholder text. Set OPENROUTER_MODEL on Render to change it
+        # without a code change.
+        self.model    = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+        # Free models share one capacity pool per upstream provider, so a
+        # busy pool returns 429 for everyone. OpenRouter tries these, in
+        # order, when the main model is rate-limited or down. openrouter/free
+        # is OpenRouter's own router to any free model with capacity, so it is
+        # the last resort. Comma-separated, editable on Render without a code
+        # change.
+        fallback_env = os.getenv(
+            "OPENROUTER_FALLBACK_MODELS",
+            "thinkingmachines/inkling:free,openrouter/free",
+        )
+        self.fallback_models = [m.strip() for m in fallback_env.split(",") if m.strip() and m.strip() != self.model]
+        # Some models (Nemotron Ultra, gpt-oss) "think" before answering, and
         # those thinking tokens come out of max_tokens. Low effort keeps
-        # answers fast; the extra budget stops the thinking from using up
-        # the whole limit and leaving an empty answer.
+        # answers fast; the extra budget stops the thinking from using up the
+        # whole limit and leaving an empty answer. Ignored by non-reasoning
+        # models.
         self.reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "low")
         self.reasoning_budget = int(os.getenv("OPENROUTER_REASONING_BUDGET", 1500))
         # Use app URL from env for production; fallback to localhost for development
@@ -71,9 +86,14 @@ class OpenRouterAIService:
             logger.warning("OPENROUTER_API_KEY not set — AI features will use fallback mode.")
             self.client = None
         else:
+            # FIXED: the SDK retried every failure twice on its own, on top
+            # of query_with_retry's attempts, so one comparison fired up to
+            # six requests into an already rate-limited pool in ~4 seconds.
+            # Retrying is now done only by query_with_retry, with a pause.
             self.client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
+                max_retries=0,
                 default_headers={
                     "HTTP-Referer": self.app_url,
                     "X-Title": "StockVision Pro"
@@ -83,7 +103,7 @@ class OpenRouterAIService:
         self.rate_limiter = RateLimiter(max_requests=10, time_window=60)
         self.cache: Dict[str, tuple] = {}
         self.cache_ttl = int(os.getenv("AI_CACHE_TTL", 900))  # 15 min
-        logger.info(f"OpenRouter AI Service ready — model: {self.model}")
+        logger.info(f"OpenRouter AI Service ready — model: {self.model}, fallbacks: {self.fallback_models}")
 
     # ------------------------------------------------------------------
     # Core query

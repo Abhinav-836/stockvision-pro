@@ -21,7 +21,7 @@ StockVision Pro pulls live quotes, price history and company fundamentals from s
 ### 🤖 AI (OpenRouter)
 - Comparison summary: best for growth, value, income, safest option and top pick
 - Investment thesis, natural-language Q&A and news sentiment endpoints
-- Model is configurable with `OPENROUTER_MODEL` (default `openai/gpt-oss-120b:free`)
+- Model is configurable with `OPENROUTER_MODEL` (default `nvidia/nemotron-3-ultra-550b-a55b:free`)
 - If the AI is unavailable or rate-limited, the app falls back to rule-based answers instead of failing
 
 ## 🏗 Architecture
@@ -88,7 +88,7 @@ FINNHUB_API_KEY=your_key
 ALPHA_VANTAGE_API_KEY=your_key
 
 # Optional
-OPENROUTER_MODEL=openai/gpt-oss-120b:free
+OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
 ALPHA_VANTAGE_DAILY_LIMIT=25
 ALLOWED_ORIGINS=http://localhost:3000
 YFINANCE_PROXY_URL=            # http://user:pass@host:port, if Yahoo blocks your host
