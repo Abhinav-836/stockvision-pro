@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import StockForm from './components/StockForm';
 import CompareForm from './components/CompareForm';
 import MarketOverview from './components/MarketOverview';
@@ -73,6 +74,7 @@ function App() {
 
   return (
     <div className={`app ${isDarkMode ? 'dark' : 'light'}`}>
+      <Analytics />
       {/* Animated Background */}
       <div className="gradient-bg">
         <div className="gradient-1"></div>
