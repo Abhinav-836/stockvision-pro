@@ -1,0 +1,3 @@
+// Runs before first paint (see app/layout.js). Kept out of the 'use client'
+// theme module so the server layout can import the string.
+export const themeInitScript = `(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){document.documentElement.dataset.theme='light'}})();`;

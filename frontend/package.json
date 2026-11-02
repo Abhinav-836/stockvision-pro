@@ -1,23 +1,22 @@
 {
-    "name": "stock-advisor-frontend",
-    "version": "1.0.0",
-    "private": true,
-    "scripts": {
-        "dev": "vite",
-        "build": "vite build",
-        "preview": "vite preview"
-    },
-    "dependencies": {
-        "lucide-react": "^0.544.0",
-        "react": "^18.3.1",
-        "react-dom": "^18.3.1",
-        "recharts": "^3.7.0"
-    },
-    "devDependencies": {
-        "@vitejs/plugin-react": "^3.1.0",
-        "autoprefixer": "^10.4.24",
-        "postcss": "^8.5.6",
-        "tailwindcss": "^4.1.18",
-        "vite": "^4.5.14"
-    }
+  "name": "stockvision-pro-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1",
+    "@vercel/speed-insights": "^2.0.0",
+    "geist": "^1.9.0",
+    "lightweight-charts": "^5.2.1",
+    "next": "^16.4.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }

@@ -2351,7 +2351,7 @@ def build_stock_response(symbol: str, stock, info: Dict, hist, news: Optional[Li
             "roe":             round(roe,            2) if roe            is not None else None,
             "roa":             round(roa,            2) if roa            is not None else None,
             "current_ratio":   round(current_ratio,  2) if current_ratio  is not None else None,
-            "volatility":      round(volatility, 4),
+            "volatility":      round(volatility, 4) if volatility is not None else None,
             "fifty_two_week_high": round(fifty_two_week_high, 2),
             "fifty_two_week_low":  round(fifty_two_week_low,  2),
             "average_volume": safe_float(safe_get(info, 'averageVolume', 0)),

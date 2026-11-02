@@ -27,7 +27,7 @@ StockVision Pro pulls live quotes, price history and company fundamentals from s
 ## 🏗 Architecture
 
 ```
-React (Vite, Recharts) ──REST + WebSocket──▶ FastAPI
+Next.js (lightweight-charts) ──REST + WebSocket──▶ FastAPI
                                               │
                 ┌─────────────────────────────┼──────────────────────────┐
                 ▼                             ▼                          ▼
@@ -55,7 +55,7 @@ When every live source fails, the API returns the last real data it saw (flagged
 | Backend | Python 3.11, FastAPI, Uvicorn, pandas, NumPy, aiohttp |
 | Market data | yFinance, finnhub-python, Alpha Vantage REST, NSE REST |
 | AI | OpenRouter via the `openai` SDK |
-| Frontend | React 18, Vite, Recharts |
+| Frontend | Next.js 16 (App Router), React 19, lightweight-charts, Vercel Analytics |
 
 ## 📦 Getting started
 
@@ -90,7 +90,7 @@ ALPHA_VANTAGE_API_KEY=your_key
 # Optional
 OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free
 ALPHA_VANTAGE_DAILY_LIMIT=25
-ALLOWED_ORIGINS=http://localhost:5173
+ALLOWED_ORIGINS=http://localhost:3000
 YFINANCE_PROXY_URL=            # http://user:pass@host:port, if Yahoo blocks your host
 ```
 
@@ -107,15 +107,15 @@ The API runs at `http://localhost:8000`, with interactive docs at `http://localh
 ```bash
 cd frontend
 npm install
-echo "VITE_API_URL=http://localhost:8000" > .env
+echo "NEXT_PUBLIC_API_URL=http://localhost:8000" > .env.local
 npm run dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:3000`.
 
 ## 🚀 Deployment
 - **Backend:** Render or Railway, start command `bash start.sh` (installs requirements and runs Uvicorn on `$PORT`). Set the same environment variables as `.env`.
-- **Frontend:** Vercel, root directory `frontend`, with `VITE_API_URL` set to the backend URL.
+- **Frontend:** Vercel, root directory `frontend`, framework Next.js (pinned in `frontend/vercel.json`). The backend URL comes from `NEXT_PUBLIC_API_URL`, or the existing `VITE_API_URL`. Enable Web Analytics and Speed Insights in the Vercel project to collect visitor data.
 
 ## 🔌 Main API endpoints
 

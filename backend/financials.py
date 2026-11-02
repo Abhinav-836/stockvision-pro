@@ -264,21 +264,28 @@ def calculate_eps(info: Dict) -> Optional[float]:
 # Volatility
 # ---------------------------------------------------------------------------
 
-def calculate_volatility(hist: pd.DataFrame) -> float:
+def calculate_volatility(hist: pd.DataFrame) -> Optional[float]:
     """
-    Annualised volatility from daily log-returns.
+    Annualised volatility from daily returns, as a fraction (0.24 = 24%).
+
+    FIXED: with too little history this used to return a made-up 0.25,
+    which the UI showed as a real "25.0%" and the risk label treated as
+    measured data. It also clamped real values below 10% up to 0.10.
+    Unknown is now None; real values are only capped at 200%.
     """
     try:
         if hist is None or hist.empty or len(hist) < 20:
-            return 0.25  # Default moderate volatility
+            return None
         returns = hist['Close'].pct_change().dropna()
         if len(returns) < 20:
-            return 0.25
+            return None
         vol = float(returns.std() * np.sqrt(252))
-        return round(max(0.1, min(vol, 2.0)), 4)  # Cap at 200% volatility
+        if not np.isfinite(vol):
+            return None
+        return round(min(vol, 2.0), 4)
     except Exception as e:
         logger.error(f"Error calculating volatility: {e}")
-        return 0.25
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +309,15 @@ def calculate_technical_indicators(hist: pd.DataFrame) -> Dict:
         df['SMA_200'] = df['Close'].rolling(window=200).mean() if n >= 200 else np.nan
 
         # RSI-14
+        # FIXED: used a simple 14-day average of gains/losses, which gives
+        # different numbers from every charting platform. Standard RSI uses
+        # Wilder's smoothing (an EMA with alpha = 1/14). A window with no
+        # losses at all is RSI 100, not "unknown".
         delta = df['Close'].diff()
-        gain  = delta.where(delta > 0, 0.0).rolling(window=14).mean()
-        loss  = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+        gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
         rs    = gain / loss.replace(0, np.nan)
-        rsi   = 100 - (100 / (1 + rs))
+        rsi   = (100 - (100 / (1 + rs))).where(loss != 0, 100.0).where(gain.notna())
 
         # MACD
         exp1      = df['Close'].ewm(span=12, adjust=False).mean()
@@ -332,16 +343,27 @@ def calculate_technical_indicators(hist: pd.DataFrame) -> Dict:
         hist_val   = _last(histogram)
 
         # Trend
+        # FIXED: "Strong Bullish" only looked at price > SMA20 > SMA50 and
+        # ignored momentum, so it could sit next to a bearish MACD
+        # crossover (AAPL showed both at once). Direction now comes from
+        # the longer averages (SMA50/SMA200 when there is a year of data),
+        # and "Strong" requires MACD to agree.
+        long_avg  = sma_200 if sma_200 is not None else sma_50
+        short_avg = sma_50 if sma_200 is not None else sma_20
+        momentum_up = None
+        if macd_val is not None and signal_val is not None:
+            momentum_up = macd_val > signal_val
+
         trend = "Neutral"
-        if sma_20 is not None and sma_50 is not None:
-            if current_price > sma_20 > sma_50:
-                trend = "Strong Bullish"
-            elif current_price > sma_20:
-                trend = "Bullish"
-            elif current_price < sma_20 < sma_50:
-                trend = "Strong Bearish"
-            elif current_price < sma_20:
-                trend = "Bearish"
+        if short_avg is not None and long_avg is not None:
+            if current_price > short_avg > long_avg:
+                trend = "Strong Bullish" if momentum_up else "Bullish"
+            elif current_price < short_avg < long_avg:
+                trend = "Strong Bearish" if momentum_up is False else "Bearish"
+            elif current_price > long_avg:
+                trend = "Bullish" if momentum_up else "Neutral"
+            elif current_price < long_avg:
+                trend = "Bearish" if momentum_up is False else "Neutral"
         elif sma_20 is not None:
             trend = "Bullish" if current_price > sma_20 else "Bearish"
 
@@ -691,17 +713,18 @@ def calculate_ai_score(metrics: Dict) -> float:
             score += 2
 
     # --- Risk / volatility (10 pts) ----------------------------------------
-    vol = metrics.get('volatility', 0.25)
-    if vol < 0.3:
-        score += 10
-    elif vol < 0.5:
-        score += 8
-    elif vol < 0.8:
-        score += 6
-    elif vol < 1.2:
-        score += 4
-    else:
-        score += 2
+    vol = metrics.get('volatility')
+    if isinstance(vol, (int, float)):
+        if vol < 0.3:
+            score += 10
+        elif vol < 0.5:
+            score += 8
+        elif vol < 0.8:
+            score += 6
+        elif vol < 1.2:
+            score += 4
+        else:
+            score += 2
 
     # --- Technical (10 pts) -----------------------------------------------
     tech = metrics.get('technical_indicators', {})
@@ -754,17 +777,30 @@ def generate_recommendation(ai_score: float, metrics: Dict) -> Dict:
         recommendation, confidence = "Avoid", "Very Low"
 
     # Risk level
-    vol = metrics.get('volatility', 0.25)
-    de = metrics.get('debt_to_equity') or 0
-    risk_score = (2 if vol > 0.8 else 1 if vol > 0.5 else 0)
-    risk_score += (2 if de > 2.0 else 1 if de > 1.0 else 0)
+    # FIXED: volatility only counted above 50%, so a stock swinging 45% a
+    # year with modest debt was "Low Risk". Volatility is graded against
+    # the market (~15-20% a year for the S&P 500), and missing data is
+    # reported as such instead of defaulting to "Low Risk".
+    vol = metrics.get('volatility')
+    de = metrics.get('debt_to_equity')
+    has_vol = isinstance(vol, (int, float))
+    has_de = isinstance(de, (int, float))
 
-    if risk_score >= 3:
-        risk_level = "High Risk"
-    elif risk_score >= 1:
-        risk_level = "Moderate Risk"
+    if not has_vol and not has_de:
+        risk_level = "Insufficient data"
     else:
-        risk_level = "Low Risk"
+        risk_score = 0
+        if has_vol:
+            risk_score += 3 if vol >= 0.55 else 2 if vol >= 0.35 else 1 if vol >= 0.20 else 0
+        if has_de:
+            risk_score += 2 if de > 2.0 else 1 if de > 1.0 else 0
+
+        if risk_score >= 3:
+            risk_level = "High Risk"
+        elif risk_score >= 1:
+            risk_level = "Moderate Risk"
+        else:
+            risk_level = "Low Risk"
 
     # Growth potential
     roe = metrics.get('roe') or 0
