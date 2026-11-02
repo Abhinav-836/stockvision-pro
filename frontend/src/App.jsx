@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import StockForm from './components/StockForm';
 import CompareForm from './components/CompareForm';
 import MarketOverview from './components/MarketOverview';
@@ -244,6 +245,7 @@ function App() {
           </div>
         </div>
       </footer>
+      <SpeedInsights />
     </div>
   );
 }
