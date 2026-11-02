@@ -146,14 +146,28 @@ class OpenRouterAIService:
                         model=self.model,
                         messages=messages,
                         temperature=temperature,
-                        max_tokens=max_tokens,
+                        max_tokens=max_tokens + self.reasoning_budget,
                         top_p=0.7,
+                        # OpenRouter's unified reasoning setting; ignored by
+                        # non-reasoning models. exclude=True keeps the
+                        # chain of thought out of the response body.
+                        extra_body={
+                            "reasoning": {"effort": self.reasoning_effort, "exclude": True},
+                            # OpenRouter model fallback: main model first,
+                            # then the backups (max 3 models per request).
+                            "models": [self.model] + self.fallback_models[:2],
+                        },
                     )
                 ),
                 timeout=28.0
             )
-            response = completion.choices[0].message.content
+            choice = completion.choices[0]
+            response = (choice.message.content or "").strip()
             if not response:
+                logger.warning(
+                    f"OpenRouter returned an empty answer (model={self.model}, "
+                    f"finish_reason={getattr(choice, 'finish_reason', None)})"
+                )
                 return None
             # Bound the cache: it used to grow forever (one entry per
             # distinct prompt for the lifetime of the process).
@@ -185,7 +199,8 @@ class OpenRouterAIService:
             if response:
                 return response
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                # Shared free pools clear in seconds, not milliseconds.
+                await asyncio.sleep(3 * (attempt + 1))
 
         logger.error(f"All {max_retries} AI attempts failed")
         return None
@@ -247,9 +262,14 @@ class OpenRouterAIService:
         if response:
             parsed = self._extract_json(response)
             if parsed:
+                parsed["is_fallback"] = False
                 return parsed
 
-        return self._fallback_comparison(stocks_data)
+        # Flagged so the frontend doesn't present rule-based placeholder
+        # text as if an AI model wrote it.
+        fallback = self._fallback_comparison(stocks_data)
+        fallback["is_fallback"] = True
+        return fallback
 
     async def generate_investment_thesis(self, stock_data: Dict, news: List[Dict], user_id: str = "anonymous") -> Dict:
         symbol  = stock_data.get('symbol', 'N/A')

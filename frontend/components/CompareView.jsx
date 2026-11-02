@@ -277,7 +277,11 @@ export default function CompareView() {
         </section>
       )}
 
-      {ai && (ai.analysis || ai.risk_assessment) && (
+      {ai && ai.is_fallback && stocks.length > 0 && (
+        <p className="muted small">The AI summary is unavailable right now. Try again in a minute.</p>
+      )}
+
+      {ai && !ai.is_fallback && (ai.analysis || ai.risk_assessment) && (
         <section className="panel">
           <h2 className="panel-title">Summary</h2>
           <dl className="tags">

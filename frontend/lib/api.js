@@ -21,18 +21,19 @@ function setCached(key, data) {
 }
 
 async function fetchAPI(endpoint, options = {}) {
+  const { timeout = REQUEST_TIMEOUT, ...fetchOptions } = options;
   const url = endpoint.startsWith('http')
     ? endpoint
     : `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
+      headers: { 'Content-Type': 'application/json', ...fetchOptions.headers },
     });
 
     if (!response.ok) {
@@ -133,10 +134,14 @@ export async function compareStocks(symbols) {
   const cached = getCached(key);
   if (cached) return cached;
 
-  const data = await fetchWithRetry('/api/ai/compare', {
-    method: 'POST',
-    body: JSON.stringify({ symbols: clean }),
-  });
+  // The AI step can wait on a rate-limited model and try backups, so this
+  // call gets more time than the default 30s. Retried at most once: each
+  // attempt already retries the AI on the server.
+  const data = await fetchWithRetry(
+    '/api/ai/compare',
+    { method: 'POST', body: JSON.stringify({ symbols: clean }), timeout: 75 * 1000 },
+    2
+  );
   if (data && data.success === false) throw new Error(data.error || 'Comparison failed.');
   setCached(key, data);
   return data;
