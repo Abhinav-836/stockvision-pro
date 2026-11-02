@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import CompareChart, { SERIES_COLORS } from './CompareChart';
-import { compareStocks, getStockChartData } from '@/lib/api';
+import { compareStocks, getAIComparison, getStockChartData } from '@/lib/api';
 import { normalizeBars } from '@/lib/bars';
 import {
   currencyFor,
@@ -79,6 +79,8 @@ export default function CompareView() {
   const [period, setPeriod] = useState('3mo');
   const [charts, setCharts] = useState({});
   const [chartLoading, setChartLoading] = useState(false);
+  const [ai, setAi] = useState(null);
+  const [aiState, setAiState] = useState('idle'); // idle | loading | done | unavailable
   const slow = useSlowFlag(loading, 5000);
 
   const ready = symbols.length >= 2;
@@ -89,18 +91,39 @@ export default function CompareView() {
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!ready) {
-      setData(null);
-      return undefined;
-    }
+    setData(null);
+    setAi(null);
+    setAiState('idle');
+    if (!ready) return undefined;
     let cancelled = false;
     setLoading(true);
     setError('');
-    setData(null);
+
+    // Numbers first (fast), then the AI summary on its own, so a slow
+    // model never holds up the table. Starting the AI request after the
+    // numbers arrive lets the server reuse the stock data it just cached
+    // instead of fetching every stock twice in parallel.
     compareStocks(symbols)
-      .then((d) => !cancelled && setData(d))
-      .catch((e) => !cancelled && setError(e.message || 'Comparison failed.'))
-      .finally(() => !cancelled && setLoading(false));
+      .then((d) => {
+        if (cancelled) return;
+        setData(d);
+        setLoading(false);
+        setAiState('loading');
+        return getAIComparison(symbols).then((result) => {
+          if (cancelled) return;
+          if (result && !result.is_fallback && (result.analysis || result.risk_assessment)) {
+            setAi(result);
+            setAiState('done');
+          } else {
+            setAiState('unavailable');
+          }
+        }, () => !cancelled && setAiState('unavailable'));
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e.message || 'Comparison failed.');
+        setLoading(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -151,7 +174,6 @@ export default function CompareView() {
   };
 
   const stocks = data?.stocks || [];
-  const ai = data?.ai_analysis;
 
   return (
     <div className="stack">
@@ -277,11 +299,21 @@ export default function CompareView() {
         </section>
       )}
 
-      {ai && ai.is_fallback && stocks.length > 0 && (
+      {ready && aiState === 'loading' && (
+        <section className="panel" aria-busy="true">
+          <h2 className="panel-title">Summary</h2>
+          <p className="muted small">Writing an AI summary of these numbers. This can take up to a minute.</p>
+          <div className="sk" style={{ height: 14, width: '80%', marginTop: 12 }} />
+          <div className="sk" style={{ height: 14, width: '65%', marginTop: 8 }} />
+          <div className="sk" style={{ height: 14, width: '72%', marginTop: 8 }} />
+        </section>
+      )}
+
+      {ready && aiState === 'unavailable' && (
         <p className="muted small">The AI summary is unavailable right now. Try again in a minute.</p>
       )}
 
-      {ai && !ai.is_fallback && (ai.analysis || ai.risk_assessment) && (
+      {aiState === 'done' && ai && (
         <section className="panel">
           <h2 className="panel-title">Summary</h2>
           <dl className="tags">

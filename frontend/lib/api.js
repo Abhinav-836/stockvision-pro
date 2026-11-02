@@ -124,27 +124,50 @@ export async function getStockChartData(symbol, period = '1mo') {
   return bars;
 }
 
-export async function compareStocks(symbols) {
+function cleanList(symbols) {
   const clean = symbols.map(cleanSymbol).filter(Boolean);
   if (clean.length < 2) throw new Error('Enter at least 2 symbols.');
   if (new Set(clean).size !== clean.length) throw new Error('Each symbol can only appear once.');
+  // Sorted copy for the cache key only, so columns keep the typed order.
+  return { clean, key: [...clean].sort().join(',') };
+}
 
-  // Sort a copy for the cache key only, so columns keep the typed order.
-  const key = `compare:${[...clean].sort().join(',')}`;
-  const cached = getCached(key);
+// Numbers only (no AI), from /api/compare. Fast, so the table and chart
+// can show while the AI summary is still being written.
+export async function compareStocks(symbols) {
+  const { clean, key } = cleanList(symbols);
+  const cacheKey = `compare:${key}`;
+  const cached = getCached(cacheKey);
   if (cached) return cached;
 
-  // The AI step can wait on a rate-limited model and try backups, so this
-  // call gets more time than the default 30s. Retried at most once: each
-  // attempt already retries the AI on the server.
-  const data = await fetchWithRetry(
-    '/api/ai/compare',
-    { method: 'POST', body: JSON.stringify({ symbols: clean }), timeout: 75 * 1000 },
-    2
-  );
-  if (data && data.success === false) throw new Error(data.error || 'Comparison failed.');
-  setCached(key, data);
+  const data = await fetchWithRetry('/api/compare', {
+    method: 'POST',
+    body: JSON.stringify({ symbols: clean }),
+  });
+  setCached(cacheKey, data);
   return data;
+}
+
+// AI summary from /api/ai/compare. The model can be slow or rate-limited
+// and the server retries and tries backup models, so this gets 75s and is
+// not retried by the browser. Returns the ai_analysis object (with
+// is_fallback: true when no model answered).
+export async function getAIComparison(symbols) {
+  const { clean, key } = cleanList(symbols);
+  const cacheKey = `ai-compare:${key}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  const data = await fetchAPI('/api/ai/compare', {
+    method: 'POST',
+    body: JSON.stringify({ symbols: clean }),
+    timeout: 75 * 1000,
+  });
+  if (data && data.success === false) throw new Error(data.error || 'AI summary failed.');
+  const ai = data?.ai_analysis || null;
+  // Only real AI answers are cached; a fallback should be retried next time.
+  if (ai && !ai.is_fallback) setCached(cacheKey, ai);
+  return ai;
 }
 
 // Render's free tier sleeps when idle. Pinging /health as soon as the site
