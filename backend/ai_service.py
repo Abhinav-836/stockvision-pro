@@ -54,9 +54,18 @@ class OpenRouterAIService:
     def __init__(self):
         self.api_key  = os.getenv("OPENROUTER_API_KEY")
         self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.model    = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        # FIXED: meta-llama/llama-3.3-70b-instruct:free was retired on
+        # OpenRouter, so every AI call failed and the app silently fell back
+        # to its rule-based placeholder text.
+        self.model    = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
+        # gpt-oss is a reasoning model: it "thinks" before answering, and
+        # those thinking tokens come out of max_tokens. Low effort keeps
+        # answers fast; the extra budget stops the thinking from using up
+        # the whole limit and leaving an empty answer.
+        self.reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "low")
+        self.reasoning_budget = int(os.getenv("OPENROUTER_REASONING_BUDGET", 1500))
         # Use app URL from env for production; fallback to localhost for development
-        self.app_url  = os.getenv("APP_URL", "http://localhost:5173")
+        self.app_url  = os.getenv("APP_URL", "http://localhost:3000")
 
         if not self.api_key:
             logger.warning("OPENROUTER_API_KEY not set — AI features will use fallback mode.")
