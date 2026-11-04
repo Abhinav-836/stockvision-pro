@@ -40,7 +40,12 @@ export default function RootLayout({ children }) {
         </main>
         <footer className="site-footer">
           <div className="wrap footer-row">
-            <span>© {new Date().getFullYear()} StockVision Pro</span>
+            <span>
+              © {new Date().getFullYear()} StockVision Pro · Built by{' '}
+              <a href="https://github.com/Abhinav-836" style={{ color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 3 }}>
+                Abhinav Ashutosh
+              </a>
+            </span>
             <span>
               Data from NSE, Finnhub, Alpha Vantage and Yahoo Finance; may be delayed. For information only, not
               investment advice.
