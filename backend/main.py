@@ -14,6 +14,7 @@ from collections import OrderedDict, defaultdict
 import time
 import re
 import os
+import ipaddress
 import json
 import random
 import aiohttp
@@ -1520,27 +1521,55 @@ app.add_middleware(
 )
 
 
-def get_client_ip(request: Optional[Request]) -> str:
-    """Real client IP, even behind Render/Railway/Vercel's proxy.
+# Cloudflare's edge ranges (https://www.cloudflare.com/ips/). Render sits
+# behind Cloudflare, so these appear in X-Forwarded-For and must be skipped.
+_CLOUDFLARE_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+    "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+    "2a06:98c0::/29", "2c0f:f248::/32",
+)]
 
-    FIXED: request.client.host on a hosted platform is the platform's own
-    load balancer, not the visitor. The per-IP limiter below therefore put
-    EVERY visitor in one shared 60-requests/minute bucket — a single page
-    load fires ~5 requests and the ticker polls every minute, so a handful
-    of simultaneous users started getting 429s. The AI per-user limiter had
-    the same problem (10 AI calls/minute shared by everyone). The first
-    X-Forwarded-For hop is the original client.
+
+def _is_proxy_ip(ip) -> bool:
+    return not ip.is_global or any(ip.version == n.version and ip in n for n in _CLOUDFLARE_NETWORKS)
+
+
+def get_client_ip(request: Optional[Request]) -> str:
+    """Real client IP behind Render (which sits behind Cloudflare).
+
+    FIXED (again): this used to take the FIRST X-Forwarded-For entry. That
+    entry is whatever the visitor sends, so sending a different made-up
+    value on each request gave unlimited requests — bypassing both the
+    60/minute limit below and the per-user AI limit that protects the
+    OpenRouter quota. The entries a client can't forge are the ones the
+    proxies append on the right, so:
+
+      1. CF-Connecting-IP, which Cloudflare sets (overwriting any copy the
+         visitor sent);
+      2. otherwise walk X-Forwarded-For from the right, skipping private
+         and Cloudflare addresses, and take the first real public one;
+      3. otherwise the socket address.
     """
     if request is None:
         return "anonymous"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        try:
+            return str(ipaddress.ip_address(cf))
+        except ValueError:
+            pass
+    chain = [p.strip() for p in (request.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+    for candidate in reversed(chain):
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not _is_proxy_ip(ip):
+            return str(ip)
+    if chain:
+        return chain[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -2795,14 +2824,25 @@ async def search_stocks(query: str):
     results.sort(key=lambda x: (0 if x['match_type'] == 'symbol' and x['symbol'] == q else 1 if x['match_type'] == 'symbol' else 2, x['symbol']))
     return {"results": results[:15]}
 
+# Maintenance endpoints: off unless ENABLE_DEBUG_ENDPOINTS=true.
+# /api/debug makes 3 live provider calls per request and /api/cache/invalidate
+# forces fresh ones on the next visit, so leaving them public let anyone
+# drain the Finnhub / Alpha Vantage free quotas. The frontend uses neither.
+def _require_debug_endpoints() -> None:
+    if os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 @app.get("/api/cache/invalidate/{symbol}")
 async def invalidate_cache(symbol: str):
+    _require_debug_endpoints()
     symbol = symbol.upper().strip()
     invalidate_symbol_cache(symbol)
     return {"status": "ok", "symbol": symbol, "message": "Cache invalidated"}
 
 @app.get("/api/debug/{symbol}")
 async def debug_stock(symbol: str):
+    _require_debug_endpoints()
     try:
         symbol = symbol.upper().strip()
         result = {

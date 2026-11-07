@@ -1,4 +1,7 @@
 # StockVision Pro 📈
+
+[![CI](https://github.com/Abhinav-836/stockvision-pro/actions/workflows/ci.yml/badge.svg)](https://github.com/Abhinav-836/stockvision-pro/actions/workflows/ci.yml)
+
 ### AI-Powered Stock Analysis for US and Indian Markets
 
 StockVision Pro pulls live quotes, price history and company fundamentals from several free market-data sources, scores each stock with a transparent rule-based model, and adds AI-written commentary through OpenRouter.
@@ -92,6 +95,7 @@ OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
 ALPHA_VANTAGE_DAILY_LIMIT=25
 ALLOWED_ORIGINS=http://localhost:3000
 YFINANCE_PROXY_URL=            # http://user:pass@host:port, if Yahoo blocks your host
+ENABLE_DEBUG_ENDPOINTS=false   # true turns on /api/debug/{symbol} and /api/cache/invalidate/{symbol} (local debugging only)
 ```
 
 Run it:
@@ -130,5 +134,19 @@ Open `http://localhost:3000`.
 | WS | `/ws` | `{"type": "subscribe", "symbol": "AAPL"}` for live prices |
 | GET | `/health` | Health and data-source statistics |
 
+## 🧪 Tests
+
+```bash
+cd backend
+pip install -r requirements.txt pytest httpx
+python -m pytest tests
+```
+
+They never touch the network: data providers are switched off and the live-price background tasks aren't started. They cover the fallback to last-known real data when providers are down, symbol and comparison validation, the rate limit (including that a forged `X-Forwarded-For` can't get around it), Google News parsing, the cache, and the financial and technical-indicator helpers. GitHub Actions runs them and builds the frontend on every push.
+
 ## ⚠️ Disclaimer
 StockVision Pro is an educational project. Its scores, labels and AI text are generated from historical data and simple models, are not financial advice, and may be wrong or out of date. Do your own research or consult a registered adviser before investing.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
