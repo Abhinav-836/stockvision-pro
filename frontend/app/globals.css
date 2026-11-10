@@ -865,3 +865,21 @@ code {
 .note {
   margin-top: 12px;
 }
+/* ---------- Terms page ---------- */
+.legal .prose h2 {
+  margin: 28px 0 8px;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+.legal .prose p,
+.legal .prose li {
+  margin-top: 8px;
+}
+.legal .prose ul {
+  padding-left: 20px;
+  list-style: disc;
+}
+.legal .prose a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}

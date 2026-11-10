@@ -2,6 +2,7 @@ import { GeistSans } from 'geist/font/sans';
 import { GeistMono } from 'geist/font/mono';
 import { Analytics } from '@vercel/analytics/next';
 import { SpeedInsights } from '@vercel/speed-insights/next';
+import Link from 'next/link';
 import SiteHeader from '@/components/SiteHeader';
 import MarketStrip from '@/components/MarketStrip';
 import { themeInitScript } from '@/lib/theme-script';
@@ -48,7 +49,10 @@ export default function RootLayout({ children }) {
             </span>
             <span>
               Data from NSE, Finnhub, Alpha Vantage and Yahoo Finance; may be delayed. For information only, not
-              investment advice.
+              investment advice.{' '}
+              <Link href="/terms" style={{ color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 3 }}>
+                Terms &amp; privacy
+              </Link>
             </span>
           </div>
         </footer>
