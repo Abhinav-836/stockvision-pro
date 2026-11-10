@@ -13,7 +13,7 @@ export default function Terms() {
       <div className="prose">
         <h2>Not investment advice</h2>
         <p>
-          StockVision Pro is a free educational project built by Abhinav Ashutosh (StrattonTrade). Prices, charts,
+          StockVision Pro is a free educational project built by Abhinav Ashutosh (Kavorin Tech). Prices, charts,
           indicators, scores and AI-written comparisons are generated automatically from third-party data and simple
           models. They can be delayed, incomplete or wrong, and nothing here is investment, financial or tax advice or a
           recommendation to buy or sell any security. We are not registered with SEBI or any other regulator as an
